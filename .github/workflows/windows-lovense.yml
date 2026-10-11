@@ -23,7 +23,17 @@ jobs:
           rustup toolchain install 1.99.0 --profile minimal
           rustup override set 1.99.0
       - name: Resolve locked Flutter dependencies
-        run: flutter pub get --enforce-lockfile
+        shell: pwsh
+        run: |
+          $output = & flutter pub get --enforce-lockfile 2>&1
+          $code = $LASTEXITCODE
+          $output | Write-Output
+          if ($code -ne 0) {
+            $message = ($output | Select-Object -Last 40) -join "`n"
+            $message = $message.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Flutter dependency resolution failed::$message"
+            exit $code
+          }
       - name: Check changed Flutter code
         run: flutter analyze --no-fatal-infos lib/util/lovense_connect_settings.dart lib/widget/lovense_connect_address_dialog.dart lib/widget/engine_config_widget.dart lib/bloc/configuration/intiface_configuration_cubit.dart lib/intiface_central_app.dart test/util/lovense_connect_settings_test.dart test/widget/lovense_connect_address_dialog_test.dart
       - name: Flutter unit, widget, and bloc tests
