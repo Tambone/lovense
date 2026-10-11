@@ -26,7 +26,7 @@ If the phone cannot be reached, check its current address, local-network permiss
 
 ## Build the Windows app
 
-Windows builds require Windows, Visual Studio 2022 with **Desktop development with C++**, Flutter 3.44.9, and Rust 1.99.0. The Flutter build compiles and bundles the Rust library through the existing Cargokit integration.
+Windows builds require Windows, Visual Studio 2022 with **Desktop development with C++**, Flutter 3.47.7, and Rust 1.99.0. The locked dependencies require Dart 3.13, which this Flutter release includes. The Flutter build compiles and bundles the Rust library through the existing Cargokit integration.
 
 ```powershell
 rustup toolchain install 1.99.0 --profile minimal
