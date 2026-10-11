@@ -42,7 +42,7 @@ Alternatively, run `./scripts/build-windows-lovense.ps1` from Windows PowerShell
 
 Use the **whole** `build/windows/x64/runner/Release` directory. `intiface_central.exe` requires the bundled Flutter data, Flutter DLL, plugin DLLs, and Rust library. Do not replace only the uploaded launcher. Close the original app first to avoid the same settings files or server port being used by two instances.
 
-The included GitHub Actions workflow, **Build Intiface Central with Lovense Connect**, performs the checks on Windows and uploads a ZIP of the entire application directory. It must be run in a GitHub repository containing this source. The workflow has been prepared but has not been executed in this Linux workspace. The output is unsigned; no publisher signing credentials are requested or embedded.
+The [GitHub Actions workflow](https://github.com/Tambone/lovense/actions/workflows/windows-lovense.yml), **Build Intiface Central with Lovense Connect**, performs the checks on Windows and uploads a ZIP of the entire application directory. Open the latest successful run and download **Intiface-Central-Lovense-Windows-x64** under Artifacts. Extract that ZIP, then extract the application ZIP inside it and run `intiface_central.exe`. The output is unsigned; no publisher signing credentials are requested or embedded.
 
 ## Validation status
 

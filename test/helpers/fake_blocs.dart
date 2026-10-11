@@ -37,6 +37,7 @@ void stubConfigurationCubit(
   bool usePrereleaseVersion = false,
   bool useForegroundProcess = true,
   bool useLovenseConnectService = false,
+  String lovenseConnectAddress = '',
   bool useLovenseHIDDongle = false,
   bool useLovenseSerialDongle = false,
   bool hasAcknowledgedLovenseConnectDeprecation = true,
@@ -84,6 +85,7 @@ void stubConfigurationCubit(
   when(
     () => mock.useLovenseConnectService,
   ).thenReturn(useLovenseConnectService);
+  when(() => mock.lovenseConnectAddress).thenReturn(lovenseConnectAddress);
   when(() => mock.useLovenseHIDDongle).thenReturn(useLovenseHIDDongle);
   when(() => mock.useLovenseSerialDongle).thenReturn(useLovenseSerialDongle);
   when(

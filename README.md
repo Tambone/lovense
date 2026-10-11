@@ -1,5 +1,11 @@
 # Intiface® Central
 
+This repository is an unofficial maintenance fork that retains **Lovense Connect** support, including a manual phone address and Lush 4 response handling. Games use Intiface's existing Buttplug connection.
+
+For the Windows fork, open the latest successful [Windows build](https://github.com/Tambone/lovense/actions/workflows/windows-lovense.yml) and download the **Intiface-Central-Lovense-Windows-x64** artifact. Extract the artifact ZIP, then extract the application ZIP inside it. Run `intiface_central.exe` with all bundled DLLs and the `data` folder beside it. See [iPhone setup and build instructions](docs/lovense-connect-fork.md) and [validation status](VALIDATION.md).
+
+The project information and official download links below describe upstream Intiface Central.
+
 [![Patreon donate button](https://img.shields.io/badge/patreon-donate-yellow.svg)](https://www.patreon.com/qdot)
 [![Github donate button](https://img.shields.io/badge/github-donate-ff69b4.svg)](https://www.github.com/sponsors/qdot)
 [![Discourse Forums](https://img.shields.io/discourse/status?label=buttplug.io%20forums&server=https%3A%2F%2Fdiscuss.buttplug.io)](https://discuss.buttplug.io)
