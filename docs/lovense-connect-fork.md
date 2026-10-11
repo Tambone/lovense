@@ -46,4 +46,4 @@ The [GitHub Actions workflow](https://github.com/Tambone/lovense/actions/workflo
 
 ## Validation status
 
-Validation performed in the cloud is recorded in `VALIDATION.md`. Mock-server tests validate discovery, responses, command acknowledgement, retries, and stop requests. They do not establish connectivity to your physical iPhone or Lush 4. A Windows build and the final phone/device check remain required before treating this as a working replacement on your computer.
+Validation is recorded in [VALIDATION.md](../VALIDATION.md). The Windows build, Flutter and native tests, runtime-file checks, and packaged-app startup check passed. Mock-server tests validate discovery, responses, command acknowledgement, retries, and stop requests. The remaining check is connectivity to your physical iPhone and Lush 4; mock tests cannot establish whether your phone still exposes the local API.
