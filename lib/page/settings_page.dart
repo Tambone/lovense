@@ -1,0 +1,172 @@
+import 'dart:io';
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:intiface_central/bloc/configuration/intiface_configuration_cubit.dart';
+import 'package:intiface_central/bloc/engine/engine_control_bloc.dart';
+import 'package:intiface_central/bloc/util/navigation_cubit.dart';
+import 'package:flutter_settings_ui/flutter_settings_ui.dart';
+import 'package:intiface_central/widget/settings_version_widget.dart';
+import 'package:intiface_central/widget/settings_app_widget.dart';
+import 'package:intiface_central/widget/settings_reset_widget.dart';
+import 'package:intiface_central/util/intiface_util.dart';
+import 'package:permission_handler/permission_handler.dart';
+
+class SettingPage extends StatelessWidget {
+  const SettingPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    var cubit = context.watch<IntifaceConfigurationCubit>();
+    var engineIsRunning = context.watch<EngineControlBloc>().isRunning;
+    List<AbstractSettingsSection> tiles = [];
+
+    if (!cubit.useSideNavigationBar) {
+      tiles.add(
+        SettingsSection(
+          tiles: [
+            SettingsTile(
+              title: Center(
+                child: OutlinedButton.icon(
+                  icon: const Icon(Icons.help_outline),
+                  label: _settingsText("Help / About"),
+                  onPressed: () {
+                    BlocProvider.of<NavigationCubit>(context).goAbout();
+                  },
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    tiles.addAll([
+      SettingsVersionWidget(cubit: cubit, engineIsRunning: engineIsRunning),
+      SettingsAppWidget(cubit: cubit),
+      SettingsSection(
+        title: _settingsText("Experimental Features"),
+        tiles: [
+          SettingsTile.switchTile(
+            initialValue: cubit.allowExperimentalRestServer,
+            onToggle: (value) => cubit.allowExperimentalRestServer = value,
+            title: _settingsText("REST Server"),
+          ),
+          if (isDesktop())
+            SettingsTile.switchTile(
+              initialValue: cubit.usePrereleaseVersion,
+              onToggle: (value) => cubit.usePrereleaseVersion = value,
+              title: _settingsText("Use Prerelease (Beta) Version"),
+            ),
+        ],
+      ),
+      SettingsResetWidget(cubit: cubit, engineIsRunning: engineIsRunning),
+    ]);
+
+    if (Platform.isAndroid || Platform.isIOS) {
+      tiles.add(
+        SettingsSection(
+          title: _settingsText("Advanced Mobile Settings"),
+          tiles: [
+            SettingsTile.switchTile(
+              enabled: !engineIsRunning,
+              initialValue: cubit.useForegroundProcess,
+              onToggle: (value) {
+                cubit.useForegroundProcess = value;
+                showDialog<void>(
+                  context: context,
+                  barrierDismissible: false,
+                  builder: (BuildContext context) {
+                    return AlertDialog(
+                      title: const Text('App needs restart'),
+                      content: const SingleChildScrollView(
+                        child: ListBody(
+                          children: <Widget>[
+                            Text(
+                              'Changing to/from foregrounding requires an app restart. Please close and reopen the application to use foregrounding.',
+                            ),
+                          ],
+                        ),
+                      ),
+                      actions: <Widget>[
+                        TextButton(
+                          child: const Text('Ok'),
+                          onPressed: () => Navigator.of(context).pop(),
+                        ),
+                      ],
+                    );
+                  },
+                );
+              },
+              title: _settingsText("Use Foreground Process"),
+            ),
+            SettingsTile.navigation(
+              title: _settingsText("Request Bluetooth Permissions"),
+              onPressed: (context) async {
+                bool allGranted;
+                bool anyPermanentlyDenied;
+                if (Platform.isAndroid) {
+                  var statuses = await [
+                    Permission.bluetoothConnect,
+                    Permission.bluetoothScan,
+                  ].request();
+                  allGranted = statuses.values.every(
+                    (s) => s == PermissionStatus.granted,
+                  );
+                  anyPermanentlyDenied = statuses.values.any(
+                    (s) => s == PermissionStatus.permanentlyDenied,
+                  );
+                } else {
+                  var status = await Permission.bluetooth.request();
+                  allGranted = status == PermissionStatus.granted;
+                  anyPermanentlyDenied =
+                      status == PermissionStatus.permanentlyDenied;
+                }
+                if (!context.mounted) return;
+                if (anyPermanentlyDenied) {
+                  await openAppSettings();
+                } else if (allGranted) {
+                  if (!context.mounted) return;
+                  showDialog<void>(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('Bluetooth permissions granted'),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          child: const Text('Ok'),
+                        ),
+                      ],
+                    ),
+                  );
+                }
+              },
+            ),
+          ],
+        ),
+      );
+    }
+
+    List<Widget> widgets = [
+      Expanded(child: SettingsList(sections: tiles, shrinkWrap: true)),
+    ];
+
+    if (engineIsRunning) {
+      widgets.add(
+        const Text(
+          "Some settings may be unavailable while server is running.",
+          style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+        ),
+      );
+    }
+
+    // SettingsList apparently handles its own scrolling, so do not try wrapping this in scroll views or
+    // list views. It will work on desktop and break on mobile.
+    return Expanded(child: Column(children: widgets));
+  }
+}
+
+const _settingsTextStyle = TextStyle(fontFamily: 'Roboto');
+
+Text _settingsText(String text) {
+  return Text(text, style: _settingsTextStyle);
+}

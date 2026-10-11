@@ -1,0 +1,1245 @@
+name: Platform Builds
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ci/windows-builder
+    tags:
+      - 'v*'
+
+concurrency:
+  group: platform-builds-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux-amd64:
+    runs-on: linux-amd64
+    timeout-minutes: 120
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: intiface-central
+
+    steps:
+      - name: Checkout Intiface Central
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          path: intiface-central
+
+      - name: Verify build secrets
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in SENTRY_DSN DISCORD_CLIENT_ID SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required Forgejo secret: $name" >&2
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+
+      - name: Install Linux build dependencies
+        run: |
+          set -euo pipefail
+
+          if command -v apt-get >/dev/null 2>&1; then
+            SUDO=""
+            if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+              SUDO="sudo"
+            fi
+
+            $SUDO apt-get update -y
+            $SUDO apt-get install -y \
+              clang \
+              cmake \
+              curl \
+              default-jdk \
+              git \
+              libcurl4-openssl-dev \
+              libgtk-3-dev \
+              libudev-dev \
+              ninja-build \
+              pkg-config \
+              unzip \
+              xz-utils \
+              zip
+          fi
+
+      - name: Install Linux toolchains
+        run: |
+          set -euo pipefail
+
+          export RUSTUP_HOME="$HOME/.rustup"
+          export CARGO_HOME="$HOME/.cargo"
+
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          fi
+
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_HOME/bin:$PATH"
+
+          rustup update stable
+          rustup default stable
+
+          if ! command -v flutter >/dev/null 2>&1; then
+            rm -rf "$HOME/flutter"
+            git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$HOME/flutter"
+          fi
+
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/flutter/bin:$PATH"
+
+          flutter config --no-analytics
+          dart --disable-analytics
+
+      - name: Tool versions
+        run: |
+          set -euo pipefail
+
+          git --version
+          rustc --version
+          cargo --version
+          FLUTTER_COMMAND="$(command -v flutter)"
+          FLUTTER_ROOT="$(cd "$(dirname "$(dirname "$FLUTTER_COMMAND")")" && pwd)"
+          git config --global --add safe.directory "$FLUTTER_ROOT"
+          flutter --version
+          flutter doctor -v
+
+      - name: Derive build version
+        run: |
+          set -euo pipefail
+
+          PUBSPEC_VERSION="$(awk '/^version:/{print $2; exit}' pubspec.yaml)"
+          if [ -z "$PUBSPEC_VERSION" ]; then
+            echo "Could not find version in pubspec.yaml" >&2
+            exit 1
+          fi
+
+          BUILD_NAME="${PUBSPEC_VERSION%%+*}"
+          BUILD_NUMBER="${PUBSPEC_VERSION#*+}"
+          if [ "$BUILD_NUMBER" = "$PUBSPEC_VERSION" ]; then
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          fi
+
+          {
+            echo "BUILD_NAME=$BUILD_NAME"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+          } >> "$GITHUB_ENV"
+
+      - name: Rust check
+        run: cargo check --manifest-path rust/Cargo.toml --release --message-format short
+
+      - name: Flutter build
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+
+          flutter config --enable-linux-desktop
+          flutter pub get
+          flutter build linux --release \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER" \
+            --dart-define "SENTRY_DSN=$SENTRY_DSN" \
+            --dart-define "DISCORD_CLIENT_ID=$DISCORD_CLIENT_ID"
+
+      - name: Upload Linux symbols to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: ./scripts/upload-sentry-symbols.sh linux
+
+      - name: Zip Linux bundle
+        run: |
+          set -euo pipefail
+
+          if [ -r /etc/os-release ]; then
+            . /etc/os-release
+            LINUX_DISTRO_TAG="${ID:-linux}-${VERSION_ID:-unknown}"
+          else
+            LINUX_DISTRO_TAG="linux-unknown"
+          fi
+
+          ZIP="$PWD/intiface-central-v${BUILD_NAME}-linux-${LINUX_DISTRO_TAG}-x64.zip"
+          rm -f "$ZIP"
+
+          cd build/linux/x64/release/bundle
+          zip -r "$ZIP" ./*
+
+          cd "$GITHUB_WORKSPACE/intiface-central/linux"
+          zip -u "$ZIP" \
+            com.nonpolynomial.intiface_central.desktop \
+            com.nonpolynomial.intiface_central.metainfo.xml \
+            run_intiface_central
+
+          echo "LINUX_ZIP_NAME=${ZIP##*/}" >> "$GITHUB_ENV"
+
+      - name: Upload Linux artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: linux-amd64-build
+          path: intiface-central/${{ env.LINUX_ZIP_NAME }}
+          if-no-files-found: error
+
+  windows-amd64:
+    runs-on: windows-amd64
+    timeout-minutes: 120
+
+    env:
+      # SDL3's CMake/MSBuild bootstrap nests .tlog paths past the MSVC 248
+      # character directory ceiling inside the cargo build tree; disabling
+      # file tracking removes them (and skips incremental up-to-date checks,
+      # which CI builds do not rely on).
+      TrackFileAccess: "false"
+
+    defaults:
+      run:
+        shell: powershell
+        working-directory: intiface-central
+
+    steps:
+      - name: Checkout Intiface Central
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          path: intiface-central
+
+      - name: Verify build secrets
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          WINDOWS_CODESIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}
+          WINDOWS_CODESIGN_KEY_CONTAINER: ${{ secrets.WINDOWS_CODESIGN_KEY_CONTAINER }}
+          WINDOWS_CODESIGN_TOKEN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_TOKEN_PASSWORD }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          $missing = @()
+          foreach ($name in @("SENTRY_DSN", "DISCORD_CLIENT_ID", "WINDOWS_CODESIGN_CERT_BASE64", "WINDOWS_CODESIGN_KEY_CONTAINER", "WINDOWS_CODESIGN_TOKEN_PASSWORD", "SENTRY_AUTH_TOKEN", "SENTRY_ORG", "SENTRY_PROJECT")) {
+            if ([string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+              $missing += $name
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            foreach ($name in $missing) {
+              Write-Error "Missing required Forgejo secret: $name"
+            }
+            exit 1
+          }
+
+      - name: Update Rust toolchain
+        run: |
+          if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile "$env:TEMP\rustup-init.exe"
+            & "$env:TEMP\rustup-init.exe" -y --profile minimal
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value "$env:USERPROFILE\.cargo\bin"
+          $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          rustup update stable
+          rustup default stable
+
+      - name: Install Flutter toolchain
+        run: |
+          # Keep the SDK outside C:\Windows (MSBuild custom steps could not
+          # see it under System32\systemprofile) and outside %USERPROFILE%
+          # (remove-reclone per run raced any overlapping job). Fetch+reset
+          # keeps it on stable tip without deleting a live checkout.
+          $sdk = 'C:\sdk\flutter'
+          if (Test-Path "$sdk\.git") {
+            git -C $sdk fetch --depth 1 origin stable
+            git -C $sdk reset --hard FETCH_HEAD
+          } else {
+            Remove-Item -Recurse -Force $sdk -ErrorAction SilentlyContinue
+            git clone --depth 1 --branch stable https://github.com/flutter/flutter.git $sdk
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value "$sdk\bin"
+          Add-Content -Path $env:GITHUB_ENV -Value "FLUTTER_ROOT=$sdk"
+          $env:PATH = "$sdk\bin;$env:PATH"
+          flutter config --no-analytics
+          dart --disable-analytics
+
+      - name: Install NuGet CLI
+        run: |
+          $nugetDir = "C:\tools\nuget"
+          New-Item -ItemType Directory -Force $nugetDir | Out-Null
+          if (-not (Test-Path "$nugetDir\nuget.exe")) {
+            Invoke-WebRequest -Uri 'https://dist.nuget.org/win-x86-commandline/latest/nuget.exe' -OutFile "$nugetDir\nuget.exe"
+          }
+          Add-Content -Path $env:GITHUB_PATH -Value $nugetDir
+          $env:PATH = "$nugetDir;$env:PATH"
+          & "$nugetDir\nuget.exe" help -Verbosity quiet | Select-Object -First 1
+
+      - name: Tool versions
+        run: |
+          git --version
+          rustc --version
+          cargo --version
+          $flutterCommand = (Get-Command flutter -ErrorAction Stop).Source
+          $flutterRoot = Split-Path -Parent (Split-Path -Parent $flutterCommand)
+          git config --global --add safe.directory $flutterRoot
+          flutter --version
+          flutter doctor -v
+
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if ($iscc) {
+            $isccPath = $iscc.Source
+          } else {
+            $fallback = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (Test-Path $fallback) {
+              $isccPath = $fallback
+            }
+          }
+
+          if (-not $isccPath) {
+            throw "Inno Setup 6 is required. Install it or add ISCC.exe to PATH."
+          }
+
+          Write-Host "Inno Setup compiler: $isccPath"
+
+      - name: Derive build version
+        run: |
+          $versionLine = Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$' | Select-Object -First 1
+          if (-not $versionLine) {
+            throw "Could not find version in pubspec.yaml"
+          }
+
+          $fullVersion = $versionLine.Matches[0].Groups[1].Value.Trim()
+          $parts = $fullVersion -split '\+', 2
+          $buildName = $parts[0]
+          $buildNumber = if ($parts.Count -gt 1) { $parts[1] } else { "$env:GITHUB_RUN_NUMBER" }
+
+          Add-Content -Path $env:GITHUB_ENV -Value "BUILD_NAME=$buildName"
+          Add-Content -Path $env:GITHUB_ENV -Value "BUILD_NUMBER=$buildNumber"
+          Write-Host "Build name: $buildName"
+          Write-Host "Build number: $buildNumber"
+
+      - name: Rust check
+        run: cargo check --manifest-path rust/Cargo.toml --release --message-format short
+
+      - name: Flutter build
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+        run: |
+          Write-Output "=== Disk free before build ==="
+          Get-PSDrive C | Select-Object Name, @{N='FreeGB';E={[math]::Round($_.Free/1GB,1)}}
+          flutter config --enable-windows-desktop
+          flutter pub get
+          # Set in-process so MSBuild custom steps inherit it regardless of
+          # GITHUB_ENV support in the runner.
+          $env:FLUTTER_ROOT = 'C:\sdk\flutter'
+          # The runner wrapper sets ErrorActionPreference=Stop; under Windows
+          # PowerShell 5.1 that turns the build's first stderr line (e.g. a
+          # compiler warning) into a terminating NativeCommandError.
+          $ErrorActionPreference = 'Continue'
+          flutter build windows --release `
+            --dart-define "SENTRY_DSN=$env:SENTRY_DSN" `
+            --dart-define "DISCORD_CLIENT_ID=$env:DISCORD_CLIENT_ID" `
+            2>&1 | Tee-Object -FilePath windows_build.log
+          $code = $LASTEXITCODE
+          $ErrorActionPreference = 'Stop'
+          if ($code -ne 0) {
+            Write-Output "=== Disk free after failed build ==="
+            Get-PSDrive C | Select-Object Name, @{N='FreeGB';E={[math]::Round($_.Free/1GB,1)}}
+            Write-Output "=== windows_build.log: matching lines ==="
+            Select-String -Path windows_build.log -Pattern 'error|Exception|Failed|failed' |
+              Select-Object -First 40 | ForEach-Object { $_.Line }
+            Write-Output "=== windows_build.log: last 150 lines ==="
+            Get-Content windows_build.log -Tail 150
+          }
+          exit $code
+
+      - name: Sign Windows app bundle
+        env:
+          WINDOWS_CODESIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}
+          WINDOWS_CODESIGN_KEY_CONTAINER: ${{ secrets.WINDOWS_CODESIGN_KEY_CONTAINER }}
+          WINDOWS_CODESIGN_TOKEN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_TOKEN_PASSWORD }}
+          WINDOWS_CODESIGN_CSP: ${{ secrets.WINDOWS_CODESIGN_CSP }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ secrets.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Recurse `
+            -Filter signtool.exe `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signtool) {
+            throw "signtool.exe not found. Install Windows SDK signing tools on the Windows builder."
+          }
+
+          $certPath = Join-Path $env:RUNNER_TEMP "intiface-windows-codesign.cer"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_BASE64))
+
+          $csp = $env:WINDOWS_CODESIGN_CSP
+          if ([string]::IsNullOrWhiteSpace($csp)) {
+            $csp = "eToken Base Cryptographic Provider"
+          }
+
+          $timestampUrl = $env:WINDOWS_CODESIGN_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
+            $timestampUrl = "http://timestamp.digicert.com"
+          }
+
+          $keyContainer = "[{{$env:WINDOWS_CODESIGN_TOKEN_PASSWORD}}]=$env:WINDOWS_CODESIGN_KEY_CONTAINER"
+
+          $bundlePath = "build\windows\x64\runner\Release"
+          $files = Get-ChildItem $bundlePath -Recurse -File |
+            Where-Object { $_.Extension -in @(".exe", ".dll") }
+
+          foreach ($file in $files) {
+            Write-Host "Signing $($file.FullName)"
+            & $signtool.FullName sign `
+              /fd SHA256 `
+              /tr $timestampUrl `
+              /td SHA256 `
+              /f $certPath `
+              /csp $csp `
+              /kc $keyContainer `
+              /as `
+              /v `
+              $file.FullName
+
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+
+            & $signtool.FullName verify /pa /v $file.FullName
+            if ($LASTEXITCODE -ne 0) {
+              exit $LASTEXITCODE
+            }
+          }
+
+      - name: Build Inno Setup installer
+        run: |
+          $iscc = Get-Command iscc -ErrorAction SilentlyContinue
+          if ($iscc) {
+            $isccPath = $iscc.Source
+          } else {
+            $fallback = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+            if (Test-Path $fallback) {
+              $isccPath = $fallback
+            }
+          }
+
+          if (-not $isccPath) {
+            throw "Inno Setup 6 is required. Install it or add ISCC.exe to PATH."
+          }
+
+          $versionLine = Select-String -Path pubspec.yaml -Pattern '^version:\s*(.+)$' | Select-Object -First 1
+          if (-not $versionLine) {
+            throw "Could not find version in pubspec.yaml"
+          }
+
+          $env:BUILD_VERSION = (($versionLine.Matches[0].Groups[1].Value.Trim()) -split '\+')[0]
+          Write-Host "Installer version: $env:BUILD_VERSION"
+
+          & $isccPath .\intiface-central-installer.iss
+          exit $LASTEXITCODE
+
+      - name: Sign Windows installer
+        env:
+          WINDOWS_CODESIGN_CERT_BASE64: ${{ secrets.WINDOWS_CODESIGN_CERT_BASE64 }}
+          WINDOWS_CODESIGN_KEY_CONTAINER: ${{ secrets.WINDOWS_CODESIGN_KEY_CONTAINER }}
+          WINDOWS_CODESIGN_TOKEN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_TOKEN_PASSWORD }}
+          WINDOWS_CODESIGN_CSP: ${{ secrets.WINDOWS_CODESIGN_CSP }}
+          WINDOWS_CODESIGN_TIMESTAMP_URL: ${{ secrets.WINDOWS_CODESIGN_TIMESTAMP_URL }}
+        run: |
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Recurse `
+            -Filter signtool.exe `
+            -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match '\\x64\\signtool\.exe$' } |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+
+          if (-not $signtool) {
+            throw "signtool.exe not found. Install Windows SDK signing tools on the Windows builder."
+          }
+
+          $certPath = Join-Path $env:RUNNER_TEMP "intiface-windows-codesign.cer"
+          if (-not (Test-Path $certPath)) {
+            [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_CODESIGN_CERT_BASE64))
+          }
+
+          $csp = $env:WINDOWS_CODESIGN_CSP
+          if ([string]::IsNullOrWhiteSpace($csp)) {
+            $csp = "eToken Base Cryptographic Provider"
+          }
+
+          $timestampUrl = $env:WINDOWS_CODESIGN_TIMESTAMP_URL
+          if ([string]::IsNullOrWhiteSpace($timestampUrl)) {
+            $timestampUrl = "http://timestamp.digicert.com"
+          }
+
+          $keyContainer = "[{{$env:WINDOWS_CODESIGN_TOKEN_PASSWORD}}]=$env:WINDOWS_CODESIGN_KEY_CONTAINER"
+          $installerPath = "installer\intiface-central-installer.exe"
+
+          & $signtool.FullName sign `
+            /fd SHA256 `
+            /tr $timestampUrl `
+            /td SHA256 `
+            /f $certPath `
+            /csp $csp `
+            /kc $keyContainer `
+            /v `
+            $installerPath
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          & $signtool.FullName verify /pa /v $installerPath
+          exit $LASTEXITCODE
+
+      - name: Stage Windows artifacts
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Copy-Item "installer\intiface-central-installer.exe" "intiface-central-v$env:BUILD_NAME-win-x64.exe" -Force
+          Copy-Item "build\windows\x64\runner\Release\intiface_central.pdb" "intiface_central.pdb" -Force
+
+          $exe = Get-Item "intiface-central-v$env:BUILD_NAME-win-x64.exe"
+          $pdb = Get-Item "intiface_central.pdb"
+          Write-Host "Windows release artifact: $($exe.Name) ($($exe.Length) bytes)"
+          Write-Host "Windows debug symbols: $($pdb.Name) ($($pdb.Length) bytes)"
+
+      - name: Upload Windows artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: windows-x64-build
+          path: intiface-central/intiface-central-v${{ env.BUILD_NAME }}-win-x64.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload Windows debug symbols
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: windows-x64-pdb
+          path: intiface-central/intiface_central.pdb
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload Windows symbols to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $sentryCli = Get-Command sentry-cli -ErrorAction SilentlyContinue
+          if ($sentryCli) {
+            $sentryCliPath = $sentryCli.Source
+          } else {
+            $tempRoot = $env:RUNNER_TEMP
+            if ([string]::IsNullOrWhiteSpace($tempRoot)) {
+              $tempRoot = [IO.Path]::GetTempPath()
+            }
+
+            $installDir = Join-Path $tempRoot "sentry-cli"
+            New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+
+            $sentryCliPath = Join-Path $installDir "sentry-cli.exe"
+            Invoke-WebRequest `
+              -Uri "https://downloads.sentry-cdn.com/sentry-cli/3.4.3/sentry-cli-Windows-x86_64.exe" `
+              -OutFile $sentryCliPath
+          }
+
+          $symbolPath = "build\windows\x64\runner\Release"
+          if (-not (Test-Path $symbolPath)) {
+            throw "Build output not found at '$symbolPath'."
+          }
+
+          Write-Host "Uploading Windows debug symbols from $symbolPath..."
+          & $sentryCliPath debug-files upload `
+            --org $env:SENTRY_ORG `
+            --project $env:SENTRY_PROJECT `
+            --include-sources `
+            --wait `
+            $symbolPath
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          Write-Host "Debug symbol upload complete."
+
+  macos-universal:
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: intiface-central
+
+    steps:
+      - name: Checkout Intiface Central
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          path: intiface-central
+
+      - name: Verify build secrets
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in SENTRY_DSN DISCORD_CLIENT_ID SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_API_ISSUER_ID APP_STORE_CONNECT_API_KEY_BASE64; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required Forgejo secret: $name" >&2
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+
+      - name: Install macOS build dependencies
+        run: |
+          set -euo pipefail
+
+          brew install cmake
+
+      - name: Update Rust toolchain
+        run: |
+          set -euo pipefail
+
+          export RUSTUP_HOME="$HOME/.rustup"
+          export CARGO_HOME="$HOME/.cargo"
+
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          fi
+
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_HOME/bin:$PATH"
+
+          rustup update stable
+          rustup default stable
+
+      - name: Install Flutter toolchain
+        run: |
+          set -euo pipefail
+
+          rm -rf "$HOME/flutter"
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$HOME/flutter"
+
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/flutter/bin:$PATH"
+
+          flutter config --no-analytics
+          dart --disable-analytics
+
+      - name: Tool versions
+        run: |
+          set -euo pipefail
+
+          git --version
+          rustc --version
+          cargo --version
+          xcodebuild -version
+          FLUTTER_COMMAND="$(command -v flutter)"
+          FLUTTER_ROOT="$(cd "$(dirname "$(dirname "$FLUTTER_COMMAND")")" && pwd)"
+          git config --global --add safe.directory "$FLUTTER_ROOT"
+          flutter --version
+          flutter doctor -v
+          security find-identity -v -p codesigning || true
+
+      - name: Derive build version
+        run: |
+          set -euo pipefail
+
+          PUBSPEC_VERSION="$(awk '/^version:/{print $2; exit}' pubspec.yaml)"
+          if [ -z "$PUBSPEC_VERSION" ]; then
+            echo "Could not find version in pubspec.yaml" >&2
+            exit 1
+          fi
+
+          BUILD_NAME="${PUBSPEC_VERSION%%+*}"
+          BUILD_NUMBER="${PUBSPEC_VERSION#*+}"
+          if [ "$BUILD_NUMBER" = "$PUBSPEC_VERSION" ]; then
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          fi
+
+          {
+            echo "BUILD_NAME=$BUILD_NAME"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+          } >> "$GITHUB_ENV"
+
+      - name: Add macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Build macOS app
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          caffeinate -dimsu -w "$$" &
+          CAFFEINATE_PID=$!
+          trap 'kill "$CAFFEINATE_PID" 2>/dev/null || true; rm -f "${APP_STORE_CONNECT_API_KEY_PATH:-}"' EXIT
+
+          APP_STORE_CONNECT_API_KEY_PATH="${RUNNER_TEMP:-$PWD/build}/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          mkdir -p "$(dirname "$APP_STORE_CONNECT_API_KEY_PATH")"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 -D > "$APP_STORE_CONNECT_API_KEY_PATH"
+          chmod 600 "$APP_STORE_CONNECT_API_KEY_PATH"
+          XCODE_AUTH_ARGS=(
+            -authenticationKeyPath "$APP_STORE_CONNECT_API_KEY_PATH"
+            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID"
+            -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID"
+          )
+
+          flutter config --enable-macos-desktop
+          flutter pub get
+          flutter build macos --release --config-only \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER" \
+            --dart-define "SENTRY_DSN=$SENTRY_DSN" \
+            --dart-define "DISCORD_CLIENT_ID=$DISCORD_CLIENT_ID"
+
+          DERIVED_DATA_PATH="$PWD/build/macos/DerivedData"
+          ARCHIVE_PATH="$PWD/build/macos/archive/Intiface Central.xcarchive"
+          EXPORT_PATH="$PWD/build/macos/export"
+          DEVELOPER_ID_EXPORT_PATH="$PWD/build/macos/developer-id-export"
+          DEVELOPER_ID_STAGING_PATH="$PWD/build/macos/developer-id-dmg"
+          DEVELOPER_ID_NOTARY_ZIP="$PWD/build/macos/intiface-central-macos-developer-id-notary.zip"
+          DEVELOPER_ID_DMG="$PWD/intiface-central-v${BUILD_NAME}-macos-universal.dmg"
+          rm -rf "$DERIVED_DATA_PATH"
+          rm -rf "$ARCHIVE_PATH" "$EXPORT_PATH" "$DEVELOPER_ID_EXPORT_PATH" "$DEVELOPER_ID_STAGING_PATH" "$DEVELOPER_ID_NOTARY_ZIP"
+          rm -f "$DEVELOPER_ID_DMG"
+
+          xcodebuild archive \
+            -workspace macos/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -archivePath "$ARCHIVE_PATH" \
+            -destination "generic/platform=macOS" \
+            -allowProvisioningUpdates \
+            "${XCODE_AUTH_ARGS[@]}" \
+            ARCHS="x86_64 arm64" \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM=MSRA4LCTEZ
+
+          APP_PATH="$ARCHIVE_PATH/Products/Applications/Intiface Central.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Could not find macOS app bundle at $APP_PATH" >&2
+            find "$ARCHIVE_PATH" -maxdepth 5 -print >&2 || true
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          EXECUTABLE="$APP_PATH/Contents/MacOS/Intiface Central"
+          lipo -info "$EXECUTABLE"
+          lipo "$EXECUTABLE" -verify_arch x86_64 arm64
+
+          while IFS= read -r binary; do
+            if file "$binary" | grep -q "Mach-O"; then
+              lipo "$binary" -verify_arch x86_64 arm64
+            fi
+          done < <(find "$APP_PATH" -type f)
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist ci/export-options/macos-app-store-connect.plist \
+            -allowProvisioningUpdates \
+            "${XCODE_AUTH_ARGS[@]}"
+
+          EXPORTED_PKG="$(find "$EXPORT_PATH" -maxdepth 1 -name '*.pkg' -print -quit)"
+          if [ -z "$EXPORTED_PKG" ]; then
+            echo "Could not find exported macOS package in $EXPORT_PATH" >&2
+            find "$EXPORT_PATH" -maxdepth 3 -print >&2 || true
+            exit 1
+          fi
+
+          cp "$EXPORTED_PKG" "$PWD/intiface-central-macos-app-store.pkg"
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$DEVELOPER_ID_EXPORT_PATH" \
+            -exportOptionsPlist ci/export-options/macos-developer-id.plist \
+            -allowProvisioningUpdates \
+            "${XCODE_AUTH_ARGS[@]}"
+
+          DEVELOPER_ID_APP="$(find "$DEVELOPER_ID_EXPORT_PATH" -maxdepth 2 -name 'Intiface Central.app' -type d -print -quit)"
+          if [ -z "$DEVELOPER_ID_APP" ]; then
+            echo "Could not find exported Developer ID app in $DEVELOPER_ID_EXPORT_PATH" >&2
+            find "$DEVELOPER_ID_EXPORT_PATH" -maxdepth 3 -print >&2 || true
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$DEVELOPER_ID_APP"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$DEVELOPER_ID_APP" \
+            "$DEVELOPER_ID_NOTARY_ZIP"
+
+          xcrun notarytool submit "$DEVELOPER_ID_NOTARY_ZIP" \
+            --key "$APP_STORE_CONNECT_API_KEY_PATH" \
+            --key-id "$APP_STORE_CONNECT_API_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_API_ISSUER_ID" \
+            --wait \
+            --timeout 2h
+
+          xcrun stapler staple "$DEVELOPER_ID_APP"
+          xcrun stapler validate "$DEVELOPER_ID_APP"
+          spctl -a -vv -t exec "$DEVELOPER_ID_APP"
+
+          mkdir -p "$DEVELOPER_ID_STAGING_PATH"
+          ditto "$DEVELOPER_ID_APP" "$DEVELOPER_ID_STAGING_PATH/Intiface Central.app"
+          ln -s /Applications "$DEVELOPER_ID_STAGING_PATH/Applications"
+          hdiutil create \
+            -volname "Intiface Central" \
+            -srcfolder "$DEVELOPER_ID_STAGING_PATH" \
+            -ov \
+            -format UDZO \
+            "$DEVELOPER_ID_DMG"
+
+          codesign --force \
+            --sign "Developer ID Application" \
+            --timestamp \
+            "$DEVELOPER_ID_DMG"
+          codesign --verify --verbose=4 "$DEVELOPER_ID_DMG"
+
+          xcrun notarytool submit "$DEVELOPER_ID_DMG" \
+            --key "$APP_STORE_CONNECT_API_KEY_PATH" \
+            --key-id "$APP_STORE_CONNECT_API_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_API_ISSUER_ID" \
+            --wait \
+            --timeout 2h
+
+          xcrun stapler staple "$DEVELOPER_ID_DMG"
+          xcrun stapler validate "$DEVELOPER_ID_DMG"
+          spctl -a -vv -t open --context context:primary-signature "$DEVELOPER_ID_DMG"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$APP_PATH" \
+            "$PWD/intiface-central-macos-universal-app.zip"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$ARCHIVE_PATH" \
+            "$PWD/intiface-central-macos.xcarchive.zip"
+
+      - name: Upload macOS symbols to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: ./scripts/upload-sentry-symbols.sh macos
+
+      - name: Upload macOS artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: macos-universal-build
+          path: |
+            intiface-central/intiface-central-macos-app-store.pkg
+            intiface-central/intiface-central-v${{ env.BUILD_NAME }}-macos-universal.dmg
+            intiface-central/intiface-central-macos-universal-app.zip
+            intiface-central/intiface-central-macos.xcarchive.zip
+          if-no-files-found: error
+
+  ios:
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: intiface-central
+
+    steps:
+      - name: Checkout Intiface Central
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          path: intiface-central
+
+      - name: Verify build secrets
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in SENTRY_DSN SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT APP_STORE_CONNECT_API_KEY_ID APP_STORE_CONNECT_API_ISSUER_ID APP_STORE_CONNECT_API_KEY_BASE64; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required Forgejo secret: $name" >&2
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+
+      - name: Install macOS build dependencies
+        run: |
+          set -euo pipefail
+
+          brew install cmake
+
+      - name: Update Rust toolchain
+        run: |
+          set -euo pipefail
+
+          export RUSTUP_HOME="$HOME/.rustup"
+          export CARGO_HOME="$HOME/.cargo"
+
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          fi
+
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_HOME/bin:$PATH"
+
+          rustup update stable
+          rustup default stable
+
+      - name: Install Flutter toolchain
+        run: |
+          set -euo pipefail
+
+          rm -rf "$HOME/flutter"
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$HOME/flutter"
+
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/flutter/bin:$PATH"
+
+          flutter config --no-analytics
+          dart --disable-analytics
+
+      - name: Tool versions
+        run: |
+          set -euo pipefail
+
+          git --version
+          rustc --version
+          cargo --version
+          xcodebuild -version
+          FLUTTER_COMMAND="$(command -v flutter)"
+          FLUTTER_ROOT="$(cd "$(dirname "$(dirname "$FLUTTER_COMMAND")")" && pwd)"
+          git config --global --add safe.directory "$FLUTTER_ROOT"
+          flutter --version
+          flutter doctor -v
+          security find-identity -v -p codesigning || true
+
+      - name: Derive build version
+        run: |
+          set -euo pipefail
+
+          PUBSPEC_VERSION="$(awk '/^version:/{print $2; exit}' pubspec.yaml)"
+          if [ -z "$PUBSPEC_VERSION" ]; then
+            echo "Could not find version in pubspec.yaml" >&2
+            exit 1
+          fi
+
+          BUILD_NAME="${PUBSPEC_VERSION%%+*}"
+          BUILD_NUMBER="${PUBSPEC_VERSION#*+}"
+          if [ "$BUILD_NUMBER" = "$PUBSPEC_VERSION" ]; then
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          fi
+
+          {
+            echo "BUILD_NAME=$BUILD_NAME"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+          } >> "$GITHUB_ENV"
+
+      - name: Add iOS Rust target
+        run: rustup target add aarch64-apple-ios
+
+      - name: Build iOS archive
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          caffeinate -dimsu -w "$$" &
+          CAFFEINATE_PID=$!
+          trap 'kill "$CAFFEINATE_PID" 2>/dev/null || true; rm -f "${APP_STORE_CONNECT_API_KEY_PATH:-}"' EXIT
+
+          APP_STORE_CONNECT_API_KEY_PATH="${RUNNER_TEMP:-$PWD/build}/AuthKey_${APP_STORE_CONNECT_API_KEY_ID}.p8"
+          mkdir -p "$(dirname "$APP_STORE_CONNECT_API_KEY_PATH")"
+          printf '%s' "$APP_STORE_CONNECT_API_KEY_BASE64" | base64 -D > "$APP_STORE_CONNECT_API_KEY_PATH"
+          chmod 600 "$APP_STORE_CONNECT_API_KEY_PATH"
+          XCODE_AUTH_ARGS=(
+            -authenticationKeyPath "$APP_STORE_CONNECT_API_KEY_PATH"
+            -authenticationKeyID "$APP_STORE_CONNECT_API_KEY_ID"
+            -authenticationKeyIssuerID "$APP_STORE_CONNECT_API_ISSUER_ID"
+          )
+
+          flutter pub get
+          flutter build ios --release --config-only \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER" \
+            --dart-define "SENTRY_DSN=$SENTRY_DSN" \
+            --dart-define "DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}"
+
+          DERIVED_DATA_PATH="$PWD/build/ios/DerivedData"
+          ARCHIVE_PATH="$PWD/build/ios/archive/Intiface Central.xcarchive"
+          EXPORT_PATH="$PWD/build/ios/export"
+          rm -rf "$DERIVED_DATA_PATH" "$ARCHIVE_PATH" "$EXPORT_PATH"
+
+          xcodebuild archive \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -derivedDataPath "$DERIVED_DATA_PATH" \
+            -archivePath "$ARCHIVE_PATH" \
+            -destination "generic/platform=iOS" \
+            -allowProvisioningUpdates \
+            "${XCODE_AUTH_ARGS[@]}" \
+            CODE_SIGN_STYLE=Automatic \
+            DEVELOPMENT_TEAM=MSRA4LCTEZ
+
+          APP_PATH="$ARCHIVE_PATH/Products/Applications/Runner.app"
+          if [ ! -d "$APP_PATH" ]; then
+            echo "Could not find iOS app bundle at $APP_PATH" >&2
+            find "$ARCHIVE_PATH" -maxdepth 5 -print >&2 || true
+            exit 1
+          fi
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportPath "$EXPORT_PATH" \
+            -exportOptionsPlist ci/export-options/ios-app-store-connect.plist \
+            -allowProvisioningUpdates \
+            "${XCODE_AUTH_ARGS[@]}"
+
+          EXPORTED_IPA="$(find "$EXPORT_PATH" -maxdepth 1 -name '*.ipa' -print -quit)"
+          if [ -z "$EXPORTED_IPA" ]; then
+            echo "Could not find exported iOS IPA in $EXPORT_PATH" >&2
+            find "$EXPORT_PATH" -maxdepth 3 -print >&2 || true
+            exit 1
+          fi
+
+          cp "$EXPORTED_IPA" "$PWD/intiface-central-ios-app-store.ipa"
+
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$ARCHIVE_PATH" \
+            "$PWD/intiface-central-ios.xcarchive.zip"
+
+      - name: Upload iOS symbols to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: ./scripts/upload-sentry-symbols.sh ios
+
+      - name: Upload iOS artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: ios-build
+          path: |
+            intiface-central/intiface-central-ios-app-store.ipa
+            intiface-central/intiface-central-ios.xcarchive.zip
+          if-no-files-found: error
+
+  android-amd64:
+    runs-on: android-amd64
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: intiface-central
+
+    steps:
+      - name: Checkout Intiface Central
+        uses: https://data.forgejo.org/actions/checkout@v4
+        with:
+          path: intiface-central
+
+      - name: Verify build secrets
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          ANDROID_KEY_PROPERTIES_BASE64: ${{ secrets.ANDROID_KEY_PROPERTIES_BASE64 }}
+          ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in SENTRY_DSN ANDROID_KEY_PROPERTIES_BASE64 ANDROID_UPLOAD_KEYSTORE_BASE64 SENTRY_AUTH_TOKEN SENTRY_ORG SENTRY_PROJECT; do
+            if [ -z "${!name:-}" ]; then
+              echo "Missing required Forgejo secret: $name" >&2
+              missing=1
+            fi
+          done
+
+          exit "$missing"
+
+      - name: Update Rust toolchain
+        run: |
+          set -euo pipefail
+
+          export RUSTUP_HOME="$HOME/.rustup"
+          export CARGO_HOME="$HOME/.cargo"
+
+          if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+          fi
+
+          echo "$CARGO_HOME/bin" >> "$GITHUB_PATH"
+          export PATH="$CARGO_HOME/bin:$PATH"
+
+          rustup update stable
+          rustup default stable
+
+      - name: Install Flutter toolchain
+        run: |
+          set -euo pipefail
+
+          rm -rf "$HOME/flutter"
+          git clone --depth 1 --branch stable https://github.com/flutter/flutter.git "$HOME/flutter"
+
+          echo "$HOME/flutter/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/flutter/bin:$PATH"
+
+          flutter config --no-analytics
+          dart --disable-analytics
+
+      - name: Tool versions
+        run: |
+          set -euo pipefail
+
+          git --version
+          java -version
+          rustc --version
+          cargo --version
+          cargo ndk --version
+          FLUTTER_COMMAND="$(command -v flutter)"
+          FLUTTER_ROOT="$(cd "$(dirname "$(dirname "$FLUTTER_COMMAND")")" && pwd)"
+          git config --global --add safe.directory "$FLUTTER_ROOT"
+          flutter --version
+          flutter doctor -v
+
+      - name: Derive build version
+        run: |
+          set -euo pipefail
+
+          PUBSPEC_VERSION="$(awk '/^version:/{print $2; exit}' pubspec.yaml)"
+          if [ -z "$PUBSPEC_VERSION" ]; then
+            echo "Could not find version in pubspec.yaml" >&2
+            exit 1
+          fi
+
+          BUILD_NAME="${PUBSPEC_VERSION%%+*}"
+          BUILD_NUMBER="${PUBSPEC_VERSION#*+}"
+          if [ "$BUILD_NUMBER" = "$PUBSPEC_VERSION" ]; then
+            BUILD_NUMBER="$GITHUB_RUN_NUMBER"
+          fi
+
+          {
+            echo "BUILD_NAME=$BUILD_NAME"
+            echo "BUILD_NUMBER=$BUILD_NUMBER"
+          } >> "$GITHUB_ENV"
+
+      - name: Restore Android signing files
+        env:
+          ANDROID_KEY_PROPERTIES_BASE64: ${{ secrets.ANDROID_KEY_PROPERTIES_BASE64 }}
+          ANDROID_UPLOAD_KEYSTORE_BASE64: ${{ secrets.ANDROID_UPLOAD_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          umask 077
+          printf '%s' "$ANDROID_KEY_PROPERTIES_BASE64" | base64 -d > android/key.properties
+          printf '%s' "$ANDROID_UPLOAD_KEYSTORE_BASE64" | base64 -d > android/app/upload-keystore.jks
+
+          test -s android/key.properties
+          test -s android/app/upload-keystore.jks
+
+      - name: Add Android Rust targets
+        run: rustup target add armv7-linux-androideabi aarch64-linux-android x86_64-linux-android
+
+      - name: Build Android artifacts
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          DISCORD_CLIENT_ID: ${{ secrets.DISCORD_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+
+          flutter pub get
+          flutter build apk --release \
+            --target-platform android-arm,android-arm64,android-x64 \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER" \
+            --dart-define "SENTRY_DSN=$SENTRY_DSN" \
+            --dart-define "DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}"
+
+          flutter build appbundle --release \
+            --target-platform android-arm,android-arm64,android-x64 \
+            --build-name "$BUILD_NAME" \
+            --build-number "$BUILD_NUMBER" \
+            --dart-define "SENTRY_DSN=$SENTRY_DSN" \
+            --dart-define "DISCORD_CLIENT_ID=${DISCORD_CLIENT_ID:-}"
+
+      - name: Verify Android native libraries
+        run: ./scripts/verify-android-native-libs.sh
+
+      - name: Stage Android artifacts
+        run: |
+          set -euo pipefail
+
+          cp build/app/outputs/flutter-apk/app-release.apk \
+            "intiface-central-v${BUILD_NAME}-android-arm-universal.apk"
+
+      - name: Upload Android symbols to Sentry
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          SENTRY_ORG: ${{ secrets.SENTRY_ORG }}
+          SENTRY_PROJECT: ${{ secrets.SENTRY_PROJECT }}
+        run: ./scripts/upload-sentry-symbols.sh android
+
+      - name: Upload Android artifacts
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: android-release-build
+          path: |
+            intiface-central/intiface-central-v${{ env.BUILD_NAME }}-android-arm-universal.apk
+            intiface-central/build/app/outputs/bundle/release/app-release.aab
+          if-no-files-found: error

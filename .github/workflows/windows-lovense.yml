@@ -1,0 +1,47 @@
+name: Build Intiface Central with Lovense Connect
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, work]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: '3.44.9'
+          channel: stable
+          cache: true
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal
+          rustup override set 1.99.0
+      - name: Resolve locked Flutter dependencies
+        run: flutter pub get --enforce-lockfile
+      - name: Check changed Flutter code
+        run: flutter analyze --no-fatal-infos lib/util/lovense_connect_settings.dart lib/widget/lovense_connect_address_dialog.dart lib/widget/engine_config_widget.dart lib/bloc/configuration/intiface_configuration_cubit.dart lib/intiface_central_app.dart test/util/lovense_connect_settings_test.dart test/widget/lovense_connect_address_dialog_test.dart
+      - name: Flutter unit, widget, and bloc tests
+        run: flutter test
+      - name: Rust engine and Lovense Connect tests
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path rust/Cargo.toml --lib -p rust_lib_intiface_central -p buttplug_server_hwmgr_lovense_connect -j 4
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build complete Windows application
+        run: flutter build windows --release
+      - name: Bundle app and all runtime files
+        shell: pwsh
+        run: |
+          Copy-Item docs/lovense-connect-fork.md build/windows/x64/runner/Release/LOVENSE-CONNECT-README.md
+          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath Intiface-Central-Lovense-Windows-x64.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Intiface-Central-Lovense-Windows-x64
+          path: Intiface-Central-Lovense-Windows-x64.zip
+          if-no-files-found: error

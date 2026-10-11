@@ -1,0 +1,428 @@
+import 'dart:io';
+import 'package:intiface_central/widget/lovense_connect_address_dialog.dart';
+
+import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher_string.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:intiface_central/bloc/configuration/intiface_configuration_cubit.dart';
+import 'package:intiface_central/bloc/engine/engine_control_bloc.dart';
+import 'package:intiface_central/bloc/util/gui_settings_cubit.dart';
+import 'package:intiface_central/util/docs_screenshot_keys.dart';
+import 'package:intiface_central/util/intiface_util.dart';
+import 'package:flutter_settings_ui/flutter_settings_ui.dart';
+
+class EngineConfigWidget extends StatefulWidget {
+  const EngineConfigWidget({super.key});
+
+  @override
+  State<EngineConfigWidget> createState() => _EngineConfigWidgetState();
+}
+
+class _EngineConfigWidgetState extends State<EngineConfigWidget> {
+  late TextEditingController _serverNameController;
+  late TextEditingController _websocketPortController;
+  Future<void> _showDeprecationDialog(
+    BuildContext context,
+    String title,
+    String message,
+    String docUrl,
+  ) {
+    return showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(message),
+            const SizedBox(height: 12),
+            InkWell(
+              onTap: () => launchUrlString(docUrl),
+              child: const Text(
+                "Learn more",
+                style: TextStyle(
+                  color: Colors.blue,
+                  decoration: TextDecoration.underline,
+                ),
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _serverNameController = TextEditingController();
+    _websocketPortController = TextEditingController();
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    var cubit = BlocProvider.of<IntifaceConfigurationCubit>(context);
+    _serverNameController.text = cubit.serverName;
+    _websocketPortController.text = cubit.websocketServerPort.toString();
+  }
+
+  @override
+  void dispose() {
+    _serverNameController.dispose();
+    _websocketPortController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    context.select<EngineControlBloc, EngineControlState?>(
+      (bloc) =>
+          bloc.state is EngineStartedState || bloc.state is EngineStoppedState
+          ? bloc.state
+          : null,
+    );
+    var cubit = context.watch<IntifaceConfigurationCubit>();
+    var guiSettingsCubit = context.watch<GuiSettingsCubit>();
+
+    var engineIsRunning = BlocProvider.of<EngineControlBloc>(context).isRunning;
+    List<AbstractSettingsSection> tiles = [];
+
+    tiles.addAll([
+      SettingsSection(
+        title: _settingsText("Server Settings"),
+        tiles: [
+          // Turn this off until we know the server is mostly stable, or have a way to handle crash on startup
+          // gracefully.
+          SettingsTile.switchTile(
+            enabled: !engineIsRunning,
+            initialValue: cubit.startServerOnStartup,
+            onToggle: (value) => cubit.startServerOnStartup = value,
+            title: _settingsText("Start Server when Intiface Central Launches"),
+          ),
+          SettingsTile.navigation(
+            enabled: !engineIsRunning,
+            title: _settingsText("Server Name"),
+            value: _settingsText(cubit.serverName),
+            onPressed: (context) {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Server Name'),
+                  content: TextField(
+                    controller: _serverNameController,
+                    onSubmitted: (value) {
+                      cubit.serverName = value;
+                      Navigator.pop(context);
+                    },
+                    decoration: const InputDecoration(
+                      hintText: "Server Name Entry",
+                    ),
+                  ),
+                  actions: <Widget>[
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, 'Cancel'),
+                      child: const Text('Cancel'),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        cubit.serverName = _serverNameController.text;
+                        Navigator.pop(context);
+                      },
+                      child: const Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+          SettingsTile.navigation(
+            enabled: !engineIsRunning,
+            title: _settingsText("Server Port"),
+            value: _settingsText(cubit.websocketServerPort.toString()),
+            onPressed: (context) {
+              showDialog(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text('Server Port'),
+                  content: TextField(
+                    keyboardType: TextInputType.number,
+                    controller: _websocketPortController,
+                    inputFormatters: <TextInputFormatter>[
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    onSubmitted: (value) {
+                      var newPort = int.tryParse(value);
+                      if (newPort != null &&
+                          newPort > 1024 &&
+                          newPort < 65536) {
+                        cubit.websocketServerPort = newPort;
+                      }
+                      Navigator.pop(context);
+                    },
+                    decoration: const InputDecoration(
+                      hintText: "Server Port Entry",
+                    ),
+                  ),
+                  actions: <Widget>[
+                    TextButton(
+                      onPressed: () => Navigator.pop(context, 'Cancel'),
+                      child: const Text('Cancel'),
+                    ),
+                    TextButton(
+                      onPressed: () {
+                        var newPort = int.tryParse(
+                          _websocketPortController.text,
+                        );
+                        if (newPort != null &&
+                            newPort > 1024 &&
+                            newPort < 65536) {
+                          cubit.websocketServerPort = newPort;
+                        }
+                        Navigator.pop(context);
+                      },
+                      child: const Text('OK'),
+                    ),
+                  ],
+                ),
+              );
+            },
+          ),
+          SettingsTile.switchTile(
+            enabled: !engineIsRunning,
+            initialValue: cubit.websocketServerAllInterfaces,
+            onToggle: (value) => cubit.websocketServerAllInterfaces = value,
+            title: _settingsText("Listen on all network interfaces"),
+          ),
+        ],
+      ),
+    ]);
+
+    List<AbstractSettingsTile> deviceSettings = [
+      SettingsTile.switchTile(
+        enabled: !engineIsRunning,
+        initialValue: cubit.useBluetoothLE,
+        onToggle: (value) => cubit.useBluetoothLE = value,
+        title: _settingsText("Bluetooth LE"),
+      ),
+    ];
+    if (isDesktop()) {
+      deviceSettings.addAll([
+        SettingsTile.switchTile(
+          enabled: !engineIsRunning,
+          initialValue: cubit.useSdlGamepad,
+          onToggle: (value) => cubit.useSdlGamepad = value,
+          title: _settingsText("Gamepads (SDL)"),
+        ),
+      ]);
+
+      deviceSettings.addAll([
+        SettingsTile.switchTile(
+          enabled: !engineIsRunning,
+          initialValue: cubit.useLovenseConnectService,
+          onToggle: (value) => cubit.useLovenseConnectService = value,
+          title: _settingsText("Lovense Connect Service"),
+          description: const Text("Connect to toys through Lovense Connect on your phone."),
+        ),
+        SettingsTile.navigation(
+          enabled: !engineIsRunning && cubit.useLovenseConnectService,
+          title: _settingsText("Lovense Connect phone address"),
+          value: Text(cubit.lovenseConnectAddress.isEmpty ? "Automatic discovery" : cubit.lovenseConnectAddress),
+          onPressed: (context) => showDialog<void>(
+            context: context,
+            builder: (_) => LovenseConnectAddressDialog(
+              initialValue: cubit.lovenseConnectAddress,
+              onSaved: (value) => cubit.lovenseConnectAddress = value,
+            ),
+          ),
+        ),
+      ]);
+      // The Lovense HID dongle manager is unavailable on macOS; the engine
+      // gates it out because SDL's bundled hidapi collides with the hidapi
+      // crate there.
+      if (!Platform.isMacOS) {
+        deviceSettings.add(
+          SettingsTile.switchTile(
+            enabled: !engineIsRunning,
+            initialValue: cubit.useLovenseHIDDongle,
+            onToggle: (value) {
+              cubit.useLovenseHIDDongle = value;
+              if (value) {
+                _showDeprecationDialog(
+                  context,
+                  "Lovense USB Dongle Deprecated",
+                  "The Lovense USB Dongle device managers are deprecated and will be removed in the next version of Intiface Central.",
+                  "https://intiface.com/docs/intiface-central/brands/lovense/",
+                );
+              }
+            },
+            title: _settingsText(
+              "Lovense USB Dongle (HID/White Circuit Board) (DEPRECATED)",
+            ),
+          ),
+        );
+      }
+    }
+
+    deviceSettings.add(
+      SettingsTile(
+        title: _settingsText(
+          "Other Device Managers are in Advanced Settings Below",
+          textAlign: TextAlign.center,
+        ),
+      ),
+    );
+
+    tiles.add(
+      SettingsSection(
+        title: _settingsText("Device Managers"),
+        tiles: deviceSettings,
+      ),
+    );
+
+    var expansionName = "advanced-settings";
+    var advancedSettingsTiles = [
+      SettingsTile.switchTile(
+        enabled: true,
+        initialValue: guiSettingsCubit.getExpansionValue(expansionName),
+        onToggle: (value) =>
+            guiSettingsCubit.setExpansionValue(expansionName, value),
+        title: _settingsText("Show Advanced/Experimental Settings"),
+      ),
+    ];
+
+    if (guiSettingsCubit.getExpansionValue(expansionName) ?? false) {
+      advancedSettingsTiles.add(
+        SettingsTile.switchTile(
+          enabled: !engineIsRunning,
+          initialValue: cubit.broadcastServerMdns,
+          onToggle: (value) => cubit.broadcastServerMdns = value,
+          title: _settingsText("Broadcast Server Info via mDNS"),
+        ),
+      );
+      advancedSettingsTiles.add(
+        SettingsTile.navigation(
+          enabled: !engineIsRunning,
+          title: _settingsText("mDNS Identifier Suffix (Optional)"),
+          value: _settingsText(cubit.mdnsSuffix),
+          onPressed: (context) {
+            showDialog(
+              context: context,
+              builder: (context) => AlertDialog(
+                title: const Text('mDNS Suffix'),
+                content: TextField(
+                  controller: TextEditingController(text: cubit.mdnsSuffix),
+                  onSubmitted: (value) {
+                    cubit.mdnsSuffix = value;
+                    Navigator.pop(context);
+                  },
+                  decoration: const InputDecoration(
+                    hintText: "mDNS Suffix Entry",
+                  ),
+                ),
+              ),
+            );
+          },
+        ),
+      );
+    }
+
+    var advancedSettings = SettingsSection(
+      title: _settingsText("Advanced/Experimental Settings"),
+      tiles: advancedSettingsTiles,
+    );
+
+    // Add the advanced settings tiles first, then the extra advanced sections after.
+    tiles.addAll([advancedSettings]);
+
+    var advancedManagers = [
+      SettingsTile.switchTile(
+        enabled: !engineIsRunning,
+        initialValue: cubit.useDeviceWebsocketServer,
+        onToggle: (value) => cubit.useDeviceWebsocketServer = value,
+        title: _settingsText("Device Websocket Server"),
+      ),
+      SettingsTile.switchTile(
+        enabled: !engineIsRunning,
+        initialValue: cubit.useSimulatedDevices,
+        onToggle: (value) => cubit.useSimulatedDevices = value,
+        title: _settingsText("Simulated Devices"),
+      ),
+    ];
+
+    if (!isMobile()) {
+      advancedManagers.addAll([
+        SettingsTile.switchTile(
+          enabled: !engineIsRunning,
+          initialValue: cubit.useLovenseSerialDongle,
+          onToggle: (value) {
+            cubit.useLovenseSerialDongle = value;
+            if (value) {
+              _showDeprecationDialog(
+                context,
+                "Lovense USB Dongle Deprecated",
+                "The Lovense USB Dongle device managers are deprecated and will be removed in the next version of Intiface Central.",
+                "https://docs.intiface.com/deprecation/lovense-dongle",
+              );
+            }
+          },
+          title: _settingsText(
+            "Lovense USB Dongle (Serial/Black Circuit Board) (DEPRECATED)",
+          ),
+        ),
+        SettingsTile.switchTile(
+          enabled: !engineIsRunning,
+          initialValue: cubit.useSerialPort,
+          onToggle: (value) => cubit.useSerialPort = value,
+          title: _settingsText("Serial Port"),
+        ),
+      ]);
+    }
+
+    if (guiSettingsCubit.getExpansionValue(expansionName) ?? false) {
+      tiles.add(
+        SettingsSection(
+          title: _settingsText("Advanced Device Managers"),
+          tiles: advancedManagers,
+        ),
+      );
+    }
+
+    List<Widget> widgets = [
+      Expanded(
+        child: SettingsList(
+          key: DocsScreenshotKeys.appModeSettingsBody,
+          shrinkWrap: true,
+          sections: tiles,
+        ),
+      ),
+    ];
+
+    if (engineIsRunning) {
+      widgets.add(
+        const Text(
+          "Some settings may be unavailable while server is running.",
+          style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+        ),
+      );
+    }
+
+    // SettingsList apparently handles its own scrolling, so do not try wrapping this in scroll views or
+    // list views. It will work on desktop and break on mobile.
+    return Expanded(child: Column(children: widgets));
+  }
+}
+
+const _settingsTextStyle = TextStyle(fontFamily: 'Roboto');
+
+Text _settingsText(String text, {TextAlign? textAlign}) {
+  return Text(text, textAlign: textAlign, style: _settingsTextStyle);
+}

@@ -1,0 +1,352 @@
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:intiface_central/bloc/configuration/intiface_configuration_cubit.dart';
+import 'package:intiface_central/bloc/engine/engine_control_bloc.dart';
+import 'package:intiface_central/bloc/util/error_notifier_cubit.dart';
+import 'package:intiface_central/bloc/util/navigation_cubit.dart';
+import 'package:intiface_central/bloc/util/network_info_cubit.dart';
+import 'package:intiface_central/util/bluetooth_check.dart';
+import 'package:intiface_central/util/docs_screenshot_keys.dart';
+import 'package:intiface_central/util/intiface_util.dart';
+import 'package:loggy/loggy.dart';
+import 'package:url_launcher/url_launcher_string.dart';
+
+const _troubleshootingUrl =
+    'https://intiface.com/docs/intiface-central/troubleshooting';
+
+Future<void> _showEngineErrorDialog(
+  BuildContext context, {
+  required String title,
+  required String content,
+}) async {
+  await showDialog<void>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: Text(title),
+      content: Text(content),
+      actions: [
+        TextButton(
+          onPressed: () async {
+            if (await canLaunchUrlString(_troubleshootingUrl)) {
+              await launchUrlString(_troubleshootingUrl);
+            }
+          },
+          child: const Text('Open Troubleshooting'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.of(dialogContext).pop(),
+          child: const Text('OK'),
+        ),
+      ],
+    ),
+  );
+}
+
+class ControlWidget extends StatelessWidget {
+  const ControlWidget({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return BlocBuilder<IntifaceConfigurationCubit, IntifaceConfigurationState>(
+      buildWhen: (previous, current) => current is AppModeState,
+      builder: (context, configState) {
+        return BlocConsumer<EngineControlBloc, EngineControlState>(
+          listenWhen: (previous, current) =>
+              current is EnginePortInUseState || current is EngineErrorState,
+          listener: (context, state) {
+            if (state is EnginePortInUseState) {
+              _showEngineErrorDialog(
+                context,
+                title: 'Port in use',
+                content: [
+                  'Engine error: ${state.error}',
+                  if (state.address != null) 'Address: ${state.address}',
+                  if (state.port != null) 'Port: ${state.port}',
+                ].join('\n'),
+              );
+            } else if (state is EngineErrorState) {
+              _showEngineErrorDialog(
+                context,
+                title: 'Engine error',
+                content: state.error,
+              );
+            }
+          },
+          buildWhen:
+              (EngineControlState previous, EngineControlState current) =>
+                  current is EngineStartingState ||
+                  current is EngineStartedState ||
+                  current is EngineServerCreatedState ||
+                  current is EngineStoppedState ||
+                  current is ClientConnectedState ||
+                  current is ClientDisconnectedState,
+          builder: (context, EngineControlState state) {
+            var engineControlBloc = BlocProvider.of<EngineControlBloc>(context);
+            var navCubit = BlocProvider.of<NavigationCubit>(context);
+
+            var statusMessage = "Unknown Status";
+            var statusIcon = Icons.question_mark;
+            var networkCubit = BlocProvider.of<NetworkInfoCubit>(context);
+            var configCubit = BlocProvider.of<IntifaceConfigurationCubit>(
+              context,
+            );
+            final ColorScheme colors = Theme.of(context).colorScheme;
+            void Function()? buttonAction = () =>
+                engineControlBloc.add(EngineControlEventStop());
+            if (state is ClientConnectedState) {
+              statusMessage = state.clientName;
+              statusIcon = Icons.phone_in_talk;
+            } else if (state is ClientDisconnectedState ||
+                state is EngineServerCreatedState) {
+              statusMessage = "Server running, no client connected";
+              statusIcon = Icons.phone_disabled;
+              // Once we're in this state the engine is started.
+              buttonAction = () =>
+                  engineControlBloc.add(EngineControlEventStop());
+            } else if (state is EngineStartedState) {
+              statusMessage = "Server started";
+              statusIcon = Icons.bedtime;
+              buttonAction = () =>
+                  engineControlBloc.add(EngineControlEventStop());
+            } else if (state is EngineStoppedState) {
+              statusMessage = "Server not running";
+              statusIcon = Icons.bedtime;
+              buttonAction = () async {
+                var btProblem = await checkBluetoothReady();
+                if (btProblem != null) {
+                  if (!context.mounted) return;
+                  showDialog<void>(
+                    context: context,
+                    builder: (context) => AlertDialog(
+                      title: const Text('Bluetooth Not Ready'),
+                      content: Text(btProblem),
+                      actions: [
+                        TextButton(
+                          onPressed: () => Navigator.of(context).pop(),
+                          child: const Text('OK'),
+                        ),
+                      ],
+                    ),
+                  );
+                  return;
+                }
+                if (!context.mounted) return;
+                engineControlBloc.add(
+                  EngineControlEventStart(
+                    options: await BlocProvider.of<IntifaceConfigurationCubit>(
+                      context,
+                      listen: false,
+                    ).getEngineOptions(),
+                  ),
+                );
+              };
+            } else if (state is EngineStartingState) {
+              statusIcon = Icons.start;
+              statusMessage = "Server starting";
+              buttonAction = null;
+            }
+
+            IconButton controlButton;
+
+            if (isDesktop() &&
+                configCubit.useProcessEngine &&
+                !IntifacePaths.engineFile.existsSync()) {
+              controlButton = IconButton(
+                key: DocsScreenshotKeys.engineControlButton,
+                style: IconButton.styleFrom(
+                  foregroundColor: colors.onPrimary,
+                  backgroundColor: colors.primary,
+                  disabledBackgroundColor: colors.onSurface.withValues(
+                    alpha: 0.12,
+                  ),
+                  hoverColor: colors.onPrimary.withValues(alpha: 0.08),
+                  focusColor: colors.onPrimary.withValues(alpha: 0.12),
+                  highlightColor: colors.onPrimary.withValues(alpha: 0.12),
+                ),
+                iconSize: 90,
+                onPressed: null,
+                tooltip: "Engine file not found, run Check For Updates",
+                icon: const Icon(Icons.error),
+              );
+            } else {
+              controlButton = IconButton(
+                key: DocsScreenshotKeys.engineControlButton,
+                style: IconButton.styleFrom(
+                  foregroundColor: colors.onPrimary,
+                  backgroundColor: colors.primary,
+                  disabledBackgroundColor: colors.onSurface.withValues(
+                    alpha: 0.12,
+                  ),
+                  hoverColor: colors.onPrimary.withValues(alpha: 0.08),
+                  focusColor: colors.onPrimary.withValues(alpha: 0.12),
+                  highlightColor: colors.onPrimary.withValues(alpha: 0.12),
+                ),
+                iconSize: 90,
+                onPressed: buttonAction,
+                tooltip: state is EngineStoppedState
+                    ? "Start Server"
+                    : "Stop Server",
+                icon: Icon(
+                  state is EngineStoppedState ? Icons.play_arrow : Icons.stop,
+                ),
+              );
+            }
+
+            var engineStatus = "Engine Status Unknown";
+            switch (configCubit.appMode) {
+              case AppMode.engine:
+                if (state is ClientConnectedState) {
+                  engineStatus = "${state.clientName} connected";
+                } else if (state is EngineStartedState ||
+                    state is EngineServerCreatedState ||
+                    state is ClientDisconnectedState) {
+                  engineStatus = "Engine running, waiting for client";
+                } else if (state is EngineStartingState) {
+                  engineStatus = "Engine starting...";
+                } else if (state is EngineStoppedState) {
+                  engineStatus = "Engine not running";
+                } else {
+                  logWarning("Engine Status $state unknown");
+                }
+              case AppMode.repeater:
+                {
+                  if (state is EngineStartedState ||
+                      state is EngineServerCreatedState ||
+                      state is ClientDisconnectedState) {
+                    engineStatus = "Repeater running";
+                  } else if (state is EngineStoppedState) {
+                    engineStatus = "Repeater not running";
+                  } else if (state is EngineStartingState) {
+                    engineStatus = "Repeater starting...";
+                  }
+                }
+              case AppMode.restApi:
+                {
+                  if (state is EngineStartedState ||
+                      state is EngineServerCreatedState ||
+                      state is ClientDisconnectedState) {
+                    engineStatus = "REST API Server running";
+                  } else if (state is EngineStoppedState) {
+                    engineStatus = "REST API Server not running";
+                  } else if (state is EngineStartingState) {
+                    engineStatus = "REST API Server starting...";
+                  }
+                }
+            }
+
+            List<Widget> columnWidgets = [
+              const Text(
+                "Status:",
+                style: TextStyle(fontWeight: FontWeight.bold),
+              ),
+              Text(engineStatus),
+            ];
+
+            if (configCubit.appMode == AppMode.engine) {
+              columnWidgets.addAll([
+                const Text(
+                  "Server Address:",
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                BlocBuilder<
+                  IntifaceConfigurationCubit,
+                  IntifaceConfigurationState
+                >(
+                  bloc: configCubit,
+                  buildWhen: (previous, current) =>
+                      current is WebsocketServerAllInterfacesState ||
+                      current is WebsocketServerPortState,
+                  builder: (context, state) => Text(
+                    "ws://${configCubit.websocketServerAllInterfaces ? (networkCubit.ip ?? "0.0.0.0") : "localhost"}:${configCubit.websocketServerPort}",
+                  ),
+                ),
+              ]);
+            }
+
+            return Row(
+              key: DocsScreenshotKeys.engineControlPanel,
+              children: [
+                Padding(
+                  padding: const EdgeInsets.all(5.0),
+                  child: controlButton,
+                ),
+                Expanded(
+                  child: Column(
+                    key: DocsScreenshotKeys.engineControlInfo,
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: columnWidgets,
+                  ),
+                ),
+                KeyedSubtree(
+                  key: DocsScreenshotKeys.engineAppStatus,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      BlocBuilder(
+                        bloc: BlocProvider.of<ErrorNotifierCubit>(context),
+                        builder: (context, ErrorNotifierState state) {
+                          return Visibility(
+                            visible: state is ErrorNotifierTriggerState
+                                ? true
+                                : false,
+                            child: TextButton.icon(
+                              label: const Text("Error"),
+                              onPressed: () => navCubit.goLogs(),
+                              icon: const Icon(Icons.warning),
+                              style: ButtonStyle(
+                                foregroundColor:
+                                    WidgetStateProperty.resolveWith(
+                                      (s) => Colors.red,
+                                    ),
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                      Visibility(
+                        visible:
+                            isDesktop() &&
+                            canShowUpdate() &&
+                            configCubit.currentAppVersion !=
+                                configCubit.latestAppVersion,
+                        child: TextButton.icon(
+                          label: const Text("Update"),
+                          onPressed: () => navCubit.goSettings(),
+                          icon: const Icon(Icons.update, color: Colors.green),
+                          style: ButtonStyle(
+                            foregroundColor: WidgetStateProperty.resolveWith(
+                              (s) => Colors.green,
+                            ),
+                          ),
+                        ),
+                      ),
+                      Visibility(
+                        visible: false,
+                        child: TextButton.icon(
+                          onPressed: () => navCubit.goNews(),
+                          icon: const Icon(Icons.newspaper),
+                          label: const Text("News"),
+                          style: ButtonStyle(
+                            foregroundColor: WidgetStateProperty.resolveWith(
+                              (s) => Colors.blue,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Tooltip(
+                  key: DocsScreenshotKeys.engineConnectionIcon,
+                  message: statusMessage,
+                  child: Icon(statusIcon, size: 70),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+}

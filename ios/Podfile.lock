@@ -1,0 +1,22 @@
+PODS:
+  - Flutter (1.0.0)
+  - rust_lib_intiface_central (0.0.1):
+    - Flutter
+
+DEPENDENCIES:
+  - Flutter (from `Flutter`)
+  - rust_lib_intiface_central (from `.symlinks/plugins/rust_lib_intiface_central/ios`)
+
+EXTERNAL SOURCES:
+  Flutter:
+    :path: Flutter
+  rust_lib_intiface_central:
+    :path: ".symlinks/plugins/rust_lib_intiface_central/ios"
+
+SPEC CHECKSUMS:
+  Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
+  rust_lib_intiface_central: 1c21d597a413dcdff42175c69bdf2e961b23a972
+
+PODFILE CHECKSUM: 79192f7e8ada520556b42ac74ef9d7d243c73d25
+
+COCOAPODS: 1.16.2

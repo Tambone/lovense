@@ -1,0 +1,105 @@
+# AGENTS.md
+
+This file provides guidance to AI coding agents when working with code in this repository.
+
+## Purpose
+
+This crate is the FFI bridge between Flutter/Dart and the Buttplug/Intiface Engine. It exposes Rust APIs to Flutter via `flutter_rust_bridge` and handles platform-specific initialization.
+
+## Build Commands
+
+```bash
+# Build the Rust library (usually done via flutter build)
+cargo build
+
+# Check/lint
+cargo clippy
+cargo fmt
+
+# Regenerate FFI bindings (run from project root)
+flutter_rust_bridge_codegen generate
+```
+
+## Module Structure
+
+- **api/** - Public API exposed to Flutter (added to `flutter_rust_bridge.yaml` as `rust_input`)
+  - `runtime.rs` - Engine lifecycle: start, stop, message passing
+  - `device_config.rs` - Device configuration types and management
+  - `device_config_manager.rs` - Global device config state
+  - `enums.rs` - Shared enumerations
+  - `serial_ports.rs` - Serial port enumeration, via `intiface_engine::available_serial_ports`
+  - `simulated_devices.rs` - Simulated device archetypes and user entries
+  - `specifiers.rs` - Device specifier types
+  - `util.rs` - Utility functions (Sentry init, crash triggers)
+
+  A new module is only picked up by codegen once it is declared in `api/mod.rs`; `flutter_rust_bridge.yaml` scans `crate::api` as a whole.
+- **mobile_init/** - Platform-specific runtime creation
+  - `setup/android.rs` - JNI class loader setup, `JNI_OnLoad` entry point
+  - `setup/not_android.rs` - Simple tokio runtime for non-Android
+- **in_process_frontend.rs** - Flutter frontend implementation for engine events
+- **logging.rs** - Tracing subscriber that pipes logs to Flutter via StreamSink
+- **frb_generated.rs** - Auto-generated bridge code (do not edit)
+
+## flutter_rust_bridge Patterns
+
+### Exposing External Types
+
+Use `#[frb(mirror(...))]` to expose types from external crates:
+
+```rust
+#[frb(mirror(EngineOptionsExternal))]
+pub struct _EngineOptionsExternal {
+  // Mirror all fields from intiface_engine::EngineOptionsExternal
+}
+```
+
+### Streaming Data to Flutter
+
+Use `StreamSink<T>` for continuous data flow (logs, events):
+
+```rust
+pub fn run_engine(sink: StreamSink<String>, args: EngineOptionsExternal) -> Result<()>
+```
+
+## Platform-Specific Notes
+
+### Android JNI
+
+- `JNI_OnLoad` initializes btleplug and jni-utils
+- Each tokio thread needs class loader context set via JNI calls
+- **Warning in android.rs:** The `JNI_OnLoad` function must be commented out or removed when building iOS codegen, otherwise iOS builds fail
+
+### Shutdown Timing
+
+Platform-specific Bluetooth cleanup in `stop_engine()`:
+- **macOS:** 1000ms delay (CoreBluetooth delegate callbacks are slow)
+- **Other platforms:** 500ms delay (Android JNI, Windows UWP)
+
+## Critical Version Alignment
+
+From Cargo.toml:
+> btleplug version MUST match whatever Buttplug links, otherwise there will be static misalignment and debugging is painful.
+
+Same applies to `jni` and `jni-utils` versions for Android.
+
+`flutter_rust_bridge` must also agree exactly across every surface: the Dart dependency in `pubspec.yaml`, the `=x.y.z` pin in `rust/Cargo.toml`, the installed `flutter_rust_bridge_codegen` binary, and the regenerated bindings. Explicit version checks run during `RustLib.init()` (Dart vs generated) and on first Rust handler use (generated vs Rust); successful compilation alone does not establish compatibility. Move all four together: bump `pubspec.yaml` and `rust/Cargo.toml`, run `flutter pub get` (resolving `pubspec.lock`), `cargo install flutter_rust_bridge_codegen --version <ver>`, then `flutter_rust_bridge_codegen generate`, and let `rust/Cargo.lock` resolve.
+
+## Global State
+
+Engine state managed via `lazy_static!` globals in `runtime.rs`:
+- `ENGINE_NOTIFIER` - RwLock (not OnceCell) to allow reset between runs
+- `RUNTIME` - The tokio runtime
+- `RUN_STATUS` - Whether engine is running
+- `ENGINE_SHUTDOWN` - Prevents sending to closed StreamSinks during shutdown
+
+## Log Filtering
+
+`logging.rs` filters benign third-party errors (e.g., btleplug's "Error dispatching event: SendError" on macOS) to avoid confusing users.
+
+## Dependencies
+
+Rust dependencies resolve from crates.io by default. For local development against a sibling `../buttplug` checkout, run `just deps-local` from the repo root. That writes `.cargo/config.toml` from `.cargo/config.local.toml` and refreshes the lockfile to path sources.
+
+Before committing or running the CI-equivalent dependency graph, run `just deps-crates` to remove the local override and refresh `rust/Cargo.lock` back to crates.io sources.
+
+`api/serial_ports.rs` calls `intiface_engine::available_serial_ports`, which is published as of `intiface-engine` 5.0.1, so this crate builds from crates.io.

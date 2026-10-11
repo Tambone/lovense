@@ -1,0 +1,28 @@
+import 'package:intiface_central/src/rust/api/runtime.dart';
+import 'package:intiface_central/bloc/engine/engine_provider.dart';
+
+class TestEngineProvider implements EngineProvider {
+  @override
+  Future<void> start({required EngineOptionsExternal options}) async {
+    throw "Unimplemented";
+  }
+
+  @override
+  Future<void> stop() async {
+    throw "Unimplemented";
+  }
+
+  @override
+  Future<bool> runtimeStarted() async {
+    throw "Unimplemented";
+  }
+
+  @override
+  void send(String msg) {}
+
+  @override
+  void sendBackdoorMessage(String msg) {}
+
+  @override
+  Stream<String> get engineRawMessageStream => throw "Unimplemented";
+}

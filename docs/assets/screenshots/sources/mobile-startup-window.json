@@ -1,0 +1,52 @@
+{
+  "id": "mobile-startup-window",
+  "title": "Mobile startup window",
+  "mode": "widget",
+  "viewport": {
+    "width": 1040,
+    "height": 790
+  },
+  "pixelRatio": 2,
+  "theme": "light",
+  "presentation": "window",
+  "background": "transparent",
+  "window": {
+    "width": 390,
+    "height": 633
+  },
+  "entrypoint": "mobileStartup",
+  "fixture": {
+    "engine": "stopped",
+    "useSideNavigationBar": false,
+    "newsMarkdown": "# Intiface News\n\nWelcome to Intiface Central. News and update notes appear here."
+  },
+  "callouts": [
+    {
+      "id": "control-panel",
+      "target": {
+        "key": "docs.engineControlPanel"
+      },
+      "label": "Control panel",
+      "placement": "left",
+      "highlightPadding": -4
+    },
+    {
+      "id": "navigation",
+      "target": {
+        "key": "docs.mobileNavigation"
+      },
+      "label": "Navigation",
+      "placement": "left",
+      "highlightPadding": -4
+    },
+    {
+      "id": "main-body",
+      "target": {
+        "key": "docs.mainBody"
+      },
+      "label": "Main body",
+      "placement": "right",
+      "highlightPadding": -4
+    }
+  ]
+}

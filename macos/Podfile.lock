@@ -1,0 +1,22 @@
+PODS:
+  - FlutterMacOS (1.0.0)
+  - rust_lib_intiface_central (0.0.1):
+    - FlutterMacOS
+
+DEPENDENCIES:
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - rust_lib_intiface_central (from `Flutter/ephemeral/.symlinks/plugins/rust_lib_intiface_central/macos`)
+
+EXTERNAL SOURCES:
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  rust_lib_intiface_central:
+    :path: Flutter/ephemeral/.symlinks/plugins/rust_lib_intiface_central/macos
+
+SPEC CHECKSUMS:
+  FlutterMacOS: c232990155153907050900a2e175c7773903ba4e
+  rust_lib_intiface_central: fded49dc966c9d7840562cb7ae66b0f3ad7e6d1b
+
+PODFILE CHECKSUM: 22974f8699d0fb0b86250b90bd1d0f8b2cf0bf3c
+
+COCOAPODS: 1.16.2

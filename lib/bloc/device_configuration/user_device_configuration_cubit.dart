@@ -1,0 +1,204 @@
+import 'package:bloc/bloc.dart';
+import 'package:intiface_central/util/intiface_util.dart';
+import 'package:intiface_central/src/rust/api/device_config.dart';
+import 'package:intiface_central/src/rust/api/device_config_manager.dart';
+import 'package:intiface_central/src/rust/api/simulated_devices.dart'
+    as simulated_api;
+import 'package:intiface_central/src/rust/api/specifiers.dart';
+import 'package:loggy/loggy.dart';
+
+class UserDeviceConfigurationState {}
+
+class UserDeviceConfigurationStateInitial
+    extends UserDeviceConfigurationState {}
+
+class UserDeviceConfigurationStateUpdated
+    extends UserDeviceConfigurationState {}
+
+class UserDeviceConfigurationCubit extends Cubit<UserDeviceConfigurationState> {
+  UserDeviceConfigurationCubit._()
+    : super(UserDeviceConfigurationStateInitial());
+
+  Map<ExposedUserDeviceIdentifier, ExposedServerDeviceDefinition> _configs = {};
+  Map<ExposedUserDeviceIdentifier, ExposedServerDeviceDefinition> get configs =>
+      _configs;
+  Object? _createError;
+
+  List<String> _protocols = List.empty(growable: true);
+  List<(String, ExposedWebsocketSpecifier)> _specifiers = [];
+  List<(String, ExposedSerialSpecifier)> _serialSpecifiers = [];
+  List<simulated_api.ExposedSimulatedDeviceArchetype> _simulatedArchetypes = [];
+  List<simulated_api.ExposedSimulatedDeviceConfigEntry> _simulatedDevices = [];
+  List<(String, ExposedWebsocketSpecifier)> get specifiers => _specifiers;
+  List<(String, ExposedSerialSpecifier)> get serialSpecifiers =>
+      _serialSpecifiers;
+  List<simulated_api.ExposedSimulatedDeviceArchetype> get simulatedArchetypes =>
+      _simulatedArchetypes;
+  List<simulated_api.ExposedSimulatedDeviceConfigEntry> get simulatedDevices =>
+      _simulatedDevices;
+  List<String> get protocols => _protocols;
+  Object? get createError => _createError;
+
+  static Future<UserDeviceConfigurationCubit> create() async {
+    var cubit = UserDeviceConfigurationCubit._();
+    await cubit.loadConfig();
+    return cubit;
+  }
+
+  Future<void> loadConfig() async {
+    try {
+      String? deviceConfig;
+      String? userConfig;
+      if (IntifacePaths.deviceConfigFile.existsSync()) {
+        deviceConfig = IntifacePaths.deviceConfigFile.readAsStringSync();
+      }
+      if (IntifacePaths.userDeviceConfigFile.existsSync()) {
+        userConfig = IntifacePaths.userDeviceConfigFile.readAsStringSync();
+      }
+      await setupDeviceConfigurationManager(
+        baseConfig: deviceConfig,
+        userConfig: userConfig,
+      );
+    } catch (e) {
+      _createError = e;
+      logError("Error loading cubit! Deleting configs and creating new ones.");
+      logError(e);
+      try {
+        if (await IntifacePaths.deviceConfigFile.exists()) {
+          await IntifacePaths.deviceConfigFile.delete();
+        }
+      } catch (e) {
+        logError("Error deleting device configs");
+        logError(e);
+      }
+      try {
+        if (await IntifacePaths.userDeviceConfigFile.exists()) {
+          await IntifacePaths.userDeviceConfigFile.delete();
+        }
+      } catch (e) {
+        logError("Error deleting user device configs");
+        logError(e);
+      }
+      await setupDeviceConfigurationManager(baseConfig: null, userConfig: null);
+    }
+    await update();
+  }
+
+  Future<void> update() async {
+    _protocols = await getProtocolNames();
+    _specifiers = await getUserWebsocketCommunicationSpecifiers();
+    _serialSpecifiers = await getUserSerialCommunicationSpecifiers();
+    _simulatedArchetypes = await simulated_api
+        .getAvailableSimulatedArchetypes();
+    _simulatedDevices = await simulated_api.getUserSimulatedDevices();
+    _configs = await getDeviceDefinitions();
+    emit(UserDeviceConfigurationStateUpdated());
+  }
+
+  Future<void> addWebsocketDeviceName(String protocol, String name) async {
+    await addWebsocketSpecifier(protocol: protocol, name: name);
+    await _saveConfigFile();
+  }
+
+  Future<void> removeWebsocketDeviceName(String protocol, String name) async {
+    await removeWebsocketSpecifier(protocol: protocol, name: name);
+    await _saveConfigFile();
+  }
+
+  Future<void> addSerialPort(
+    String protocol,
+    String port,
+    int baudRate,
+    int dataBits,
+    int stopBits,
+    String parity,
+  ) async {
+    await addSerialSpecifier(
+      protocol: protocol,
+      port: port,
+      baudRate: baudRate,
+      dataBits: dataBits,
+      stopBits: stopBits,
+      parity: parity,
+    );
+    await _saveConfigFile();
+  }
+
+  Future<void> removeSerialPort(String protocol, String port) async {
+    await removeSerialSpecifier(protocol: protocol, port: port);
+    await _saveConfigFile();
+  }
+
+  Future<void> addSimulatedDevice(
+    String identifier,
+    String? displayName,
+  ) async {
+    await simulated_api.addSimulatedDevice(
+      identifier: identifier,
+      displayName: displayName,
+    );
+    await _saveConfigFile();
+  }
+
+  Future<void> removeSimulatedDevice(String address) async {
+    await simulated_api.removeSimulatedDevice(address: address);
+    await _saveConfigFile();
+  }
+
+  Future<void> updateDeviceAllow(
+    ExposedUserDeviceIdentifier deviceIdentifier,
+    ExposedServerDeviceDefinition def,
+    bool allow,
+  ) async {
+    def.allow = allow;
+    await updateDefinition(deviceIdentifier, def);
+  }
+
+  Future<void> updateDeviceDeny(
+    ExposedUserDeviceIdentifier deviceIdentifier,
+    ExposedServerDeviceDefinition def,
+    bool deny,
+  ) async {
+    def.deny = deny;
+    await updateDefinition(deviceIdentifier, def);
+  }
+
+  Future<void> updateDisplayName(
+    ExposedUserDeviceIdentifier deviceIdentifier,
+    ExposedServerDeviceDefinition def,
+    String displayName,
+  ) async {
+    def.displayName = displayName;
+    await updateDefinition(deviceIdentifier, def);
+  }
+
+  Future<void> updateMessageGapMs(
+    ExposedUserDeviceIdentifier deviceIdentifier,
+    ExposedServerDeviceDefinition def,
+    int? messageGapMs,
+  ) async {
+    def.messageGapMs = messageGapMs;
+    await updateDefinition(deviceIdentifier, def);
+  }
+
+  Future<void> updateDefinition(
+    ExposedUserDeviceIdentifier deviceIdentifier,
+    ExposedServerDeviceDefinition def,
+  ) async {
+    await updateUserConfig(identifier: deviceIdentifier, config: def);
+    await _saveConfigFile();
+  }
+
+  Future<void> removeDeviceConfig(
+    ExposedUserDeviceIdentifier deviceIdentifier,
+  ) async {
+    await removeUserConfig(identifier: deviceIdentifier);
+    await _saveConfigFile();
+  }
+
+  Future<void> _saveConfigFile() async {
+    var configStr = await getUserConfigStr();
+    await IntifacePaths.userDeviceConfigFile.writeAsString(configStr);
+    await update();
+  }
+}

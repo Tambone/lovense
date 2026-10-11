@@ -1,0 +1,133 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+def localProperties = new Properties()
+def localPropertiesFile = rootProject.file('local.properties')
+if (localPropertiesFile.exists()) {
+    localPropertiesFile.withReader('UTF-8') { reader ->
+        localProperties.load(reader)
+    }
+}
+
+def flutterVersionCode = localProperties.getProperty('flutter.versionCode')
+if (flutterVersionCode == null) {
+    flutterVersionCode = '1'
+}
+
+def flutterVersionName = localProperties.getProperty('flutter.versionName')
+if (flutterVersionName == null) {
+    flutterVersionName = '1.0'
+}
+
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('key.properties')
+if (keystorePropertiesFile.exists()) {
+    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+}
+
+android {
+    namespace "com.nonpolynomial.intiface_central"
+    compileSdk 37
+    ndkVersion = "28.2.13676358"
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+        coreLibraryDesugaringEnabled = true
+    }
+
+    kotlinOptions {
+        jvmTarget = '1.8'
+    }
+
+    sourceSets {
+        main.java.srcDirs += 'src/main/kotlin'
+    }
+
+    defaultConfig {
+        // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
+        applicationId "com.nonpolynomial.intiface_central"
+        // You can update the following values to match your application needs.
+        // For more information, see: https://docs.flutter.dev/deployment/android#reviewing-the-build-configuration.
+        minSdkVersion 27
+        targetSdkVersion flutter.targetSdkVersion
+        versionCode flutterVersionCode.toInteger()
+        versionName flutterVersionName
+    }
+
+    signingConfigs {
+       release {
+           keyAlias keystoreProperties['keyAlias']
+           keyPassword keystoreProperties['keyPassword']
+           storeFile keystoreProperties['storeFile'] ? file(keystoreProperties['storeFile']) : null
+           storePassword keystoreProperties['storePassword']
+       }
+    }
+    buildTypes {
+        release {
+            // TODO: Add your own signing config for the release build.
+            // Signing with the debug keys for now, so `flutter run --release` works.
+            signingConfig signingConfigs.release
+            // signingConfig signingConfigs.debug
+
+            shrinkResources true
+            minifyEnabled true
+
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+
+        }
+    }
+}
+
+flutter {
+    source '../..'
+}
+
+dependencies {
+    implementation(name: 'droidplug', version: '+', ext: 'aar')
+    // For AGP 7.4+
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.0.3")
+    // For AGP 7.3
+    // coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:1.2.3")
+    // For AGP 4.0 to 7.2
+    // coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:1.1.9")
+}
+
+abstract class CargoNdkBuildTask extends Exec {
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDirectory()
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        def buildType = variant.buildType
+        def profileMode = buildType == 'debug' ? '' : '--release'
+
+        def cargoBuild = tasks.register("cargoBuild${buildType.capitalize()}", CargoNdkBuildTask) {
+            outputDirectory.set(layout.buildDirectory.dir("rustJniLibs/$buildType"))
+
+            def ndkCommand = """cargo ndk \
+                -t armeabi-v7a -t arm64-v8a -t x86_64 \
+                -o ${outputDirectory.get().asFile.absolutePath} build $profileMode"""
+
+            workingDir "../../rust"
+            if (org.gradle.nativeplatform.platform.internal.DefaultNativePlatform.currentOperatingSystem.isWindows()) {
+                commandLine 'cmd', '/C', ndkCommand
+            } else {
+                commandLine 'sh', '-c', ndkCommand
+            }
+
+            // Cargo does its own change detection, and Gradle cannot see the
+            // crate's sources from here, so never let it skip the invocation.
+            outputs.upToDateWhen { false }
+        }
+
+        // Registering as a generated source directory is what makes AGP wait for
+        // cargo before merging native libs. Copying into the source tree instead
+        // races the merge task and silently ships an APK with no Rust library.
+        variant.sources.jniLibs.addGeneratedSourceDirectory(cargoBuild) { it.outputDirectory }
+    }
+}

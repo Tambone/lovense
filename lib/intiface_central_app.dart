@@ -1,0 +1,756 @@
+// tray_manager is consumed through the deprecated pre-nativeapi API bridge.
+// Migration to the nativeapi-based API is planned follow-up work.
+// ignore_for_file: deprecated_member_use
+import 'dart:async';
+import 'dart:io';
+
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart' show ExternalLibrary;
+import 'package:url_launcher/url_launcher_string.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:intiface_central/bloc/api_log/native_api_log.dart';
+import 'package:intiface_central/bloc/configuration/intiface_configuration_cubit.dart';
+import 'package:intiface_central/bloc/device/device_manager_bloc.dart';
+import 'package:intiface_central/bloc/device_configuration/device_configuration.dart';
+import 'package:intiface_central/bloc/device_configuration/user_device_configuration_cubit.dart';
+import 'package:intiface_central/bloc/engine/engine_control_bloc.dart';
+import 'package:intiface_central/bloc/engine/engine_repository.dart';
+import 'package:intiface_central/bloc/engine/foreground_task_library_engine_provider.dart';
+import 'package:intiface_central/bloc/engine/library_engine_provider.dart';
+import 'package:intiface_central/bloc/update/github_update_provider.dart';
+import 'package:intiface_central/bloc/update/update_bloc.dart';
+import 'package:intiface_central/bloc/update/update_repository.dart';
+import 'package:intiface_central/bloc/util/app_reset_cubit.dart';
+import 'package:intiface_central/bloc/util/asset_cubit.dart';
+import 'package:intiface_central/bloc/util/discord_cubit.dart';
+import 'package:intiface_central/bloc/util/error_notifier_cubit.dart';
+import 'package:intiface_central/bloc/util/gui_settings_cubit.dart';
+import 'package:intiface_central/bloc/util/navigation_cubit.dart';
+import 'package:intiface_central/bloc/util/network_info_cubit.dart';
+import 'package:intiface_central/util/bluetooth_check.dart';
+import 'package:intiface_central/util/intiface_util.dart';
+import 'package:intiface_central/util/logging.dart';
+import 'package:intiface_central/util/mdns_platform_service.dart';
+import 'package:intiface_central/widget/body_widget.dart';
+import 'package:intiface_central/widget/control_widget.dart';
+import 'package:loggy/loggy.dart';
+import 'package:permission_handler/permission_handler.dart';
+import 'package:pubspec_parse/pubspec_parse.dart';
+import 'package:screen_retriever/screen_retriever.dart';
+import 'package:sentry/sentry_io.dart';
+import 'package:tray_manager/tray_manager.dart';
+import 'package:window_manager/window_manager.dart';
+import 'package:intiface_central/src/rust/frb_generated.dart';
+import 'package:intiface_central/src/rust/api/util.dart';
+import 'package:flutter/services.dart' show rootBundle;
+
+class IntifaceCentralBootstrapOptions {
+  final bool initializePaths;
+  final Directory? pathsBaseDirectory;
+  final bool initializeWindowing;
+  final bool initializeTray;
+  final bool initializeUpdates;
+  final bool initializeSentry;
+  final bool initializeDiscord;
+  final bool requestPlatformPermissions;
+  final ExternalLibrary? rustExternalLibrary;
+  final Future<void> Function()? afterRustInit;
+  final Future<void> Function(UserDeviceConfigurationCubit userConfigCubit)?
+      afterUserDeviceConfigurationInit;
+
+  const IntifaceCentralBootstrapOptions({
+    this.initializePaths = true,
+    this.pathsBaseDirectory,
+    this.initializeWindowing = true,
+    this.initializeTray = true,
+    this.initializeUpdates = true,
+    this.initializeSentry = true,
+    this.initializeDiscord = true,
+    this.requestPlatformPermissions = true,
+    this.rustExternalLibrary,
+    this.afterRustInit,
+    this.afterUserDeviceConfigurationInit,
+  });
+}
+
+// ignore: must_be_immutable
+class IntifaceCentralApp extends StatelessWidget with WindowListener, TrayListener {
+  IntifaceCentralApp._create({required this.guiSettingsCubit});
+
+  static List<bool Function(SentryEvent, {Hint? hint})> eventProcessors = [];
+  final GuiSettingsCubit guiSettingsCubit;
+
+  // Stored so tray listener callbacks (outside widget tree) can access BLoC/config.
+  EngineControlBloc? _engineControlBloc;
+  IntifaceConfigurationCubit? _configCubit;
+
+  // Cache the buildApp() future to prevent multiple concurrent initializations.
+  // This fixes a race condition where FutureBuilder would call buildApp() on every
+  // rebuild, potentially causing FFI conflicts and window initialization issues.
+  static Future<Widget>? _buildAppFuture;
+  static StreamSubscription? _apiLogSubscription;
+
+  static Future<IntifaceCentralApp> create() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    var guiSettingsCubit = await GuiSettingsCubit.create();
+    return IntifaceCentralApp._create(guiSettingsCubit: guiSettingsCubit);
+  }
+
+  void windowDisplayModeResize(bool useCompactDisplay, GuiSettingsCubit settingsCubit) {
+    const compactSize = Size(500, 175);
+    if (useCompactDisplay) {
+      windowManager.setMinimumSize(compactSize);
+      windowManager.setMaximumSize(compactSize);
+      windowManager.setSize(compactSize);
+    } else {
+      windowManager.setMinimumSize(const Size(800, 600));
+      windowManager.setMaximumSize(const Size(10000, 10000));
+      var size = settingsCubit.getWindowSize();
+      windowManager.setSize(size);
+    }
+  }
+
+  @override
+  void onWindowResize() async {
+    guiSettingsCubit.setWindowSize(await windowManager.getSize());
+  }
+
+  @override
+  void onWindowMove() async {
+    var windowPosition = await windowManager.getPosition();
+    guiSettingsCubit.setWindowPosition(windowPosition);
+  }
+
+  @override
+  void onWindowClose() async {
+    var isPreventClose = await windowManager.isPreventClose();
+    if (isPreventClose) {
+      await windowManager.hide();
+    }
+  }
+
+  Future<void> _setupTray(IntifaceConfigurationCubit configCubit) async {
+    if (configCubit.trayIconMode == "none") {
+      await trayManager.destroy();
+      trayManager.removeListener(this);
+      await windowManager.setPreventClose(false);
+      return;
+    }
+
+    await trayManager.setIcon(
+      Platform.isWindows ? 'assets/icons/intiface_central_icon.ico' : 'assets/icons/intiface_central_icon.png',
+    );
+    await trayManager.setToolTip('Intiface Central');
+    await _updateTrayMenu();
+    trayManager.addListener(this);
+
+    // In tray_only mode, intercept window close to hide instead
+    await windowManager.setPreventClose(configCubit.trayIconMode == "tray_only");
+  }
+
+  Future<void> _updateTrayMenu() async {
+    var isRunning = _engineControlBloc?.isRunning ?? false;
+    Menu menu = Menu(
+      items: [
+        MenuItem(key: 'show_window', label: 'Show Window'),
+        MenuItem.separator(),
+        MenuItem(key: 'toggle_server', label: isRunning ? 'Stop Server' : 'Start Server'),
+        MenuItem.separator(),
+        MenuItem(key: 'quit', label: 'Quit'),
+      ],
+    );
+    await trayManager.setContextMenu(menu);
+  }
+
+  @override
+  void onTrayIconMouseDown() {
+    if (Platform.isMacOS) {
+      // macOS menu bar extras conventionally show menu on any click
+      trayManager.popUpContextMenu();
+    } else {
+      windowManager.show();
+      windowManager.focus();
+    }
+  }
+
+  @override
+  void onTrayIconRightMouseDown() {
+    trayManager.popUpContextMenu();
+  }
+
+  @override
+  void onTrayMenuItemClick(MenuItem menuItem) async {
+    switch (menuItem.key) {
+      case 'show_window':
+        await windowManager.show();
+        await windowManager.focus();
+      case 'toggle_server':
+        if (_engineControlBloc != null && _configCubit != null) {
+          if (_engineControlBloc!.isRunning) {
+            _engineControlBloc!.add(EngineControlEventStop());
+          } else {
+            _engineControlBloc!.add(EngineControlEventStart(options: await _configCubit!.getEngineOptions()));
+          }
+        }
+      case 'quit':
+        if (_engineControlBloc?.isRunning ?? false) {
+          _engineControlBloc!.add(EngineControlEventStop());
+          await Future.delayed(const Duration(milliseconds: 1500));
+        }
+        await trayManager.destroy();
+        exit(0);
+    }
+  }
+
+  Future<Widget> buildApp({
+    IntifaceCentralBootstrapOptions options = const IntifaceCentralBootstrapOptions(),
+  }) async {
+    var errorNotifier = ErrorNotifier();
+    var multiPrinter = MultiPrinter(errorNotifier);
+    // Logging setup needs to happen after we've done initial setup.
+    initLogging(multiPrinter);
+    var spec = Pubspec.parse(await rootBundle.loadString('pubspec.yaml'));
+    var packageVersion = spec.version!.toString();
+    logInfo("Intiface Central $packageVersion Starting...");
+    logInfo("Running main builder");
+
+    if (options.initializePaths) {
+      logInfo("Initializing paths...");
+      await IntifacePaths.init(baseDirectory: options.pathsBaseDirectory);
+    }
+    logInfo("Starting file logger...");
+    multiPrinter.addFilePrinter();
+
+    // Bring up our settings repo.
+    var configCubit = await IntifaceConfigurationCubit.create();
+    // Set up Update/Configuration Pipe/Cubit.
+    var updateRepo = UpdateRepository(configCubit.currentNewsEtag, configCubit.currentDeviceConfigEtag);
+
+    // Set up attachments to be sent with sentry events.
+    if (options.initializeSentry && configCubit.canUseCrashReporting) {
+      logInfo("Sentry URL set, crash and log reporting available.");
+      final dir = Directory(IntifacePaths.logPath.path);
+      logInfo(IntifacePaths.logPath.path);
+      var entities = (await dir.list().toList()).whereType<File>();
+      Sentry.configureScope((scope) {
+        scope.clearAttachments();
+        final logAttachments = entities.map((e) => IoSentryAttachment.fromFile(e));
+        final userConfigAttachment = IoSentryAttachment.fromFile(IntifacePaths.userDeviceConfigFile);
+        for (var attachment in logAttachments) {
+          scope.addAttachment(attachment);
+        }
+        scope.addAttachment(userConfigAttachment);
+      });
+    } else if (!options.initializeSentry) {
+      logInfo("Sentry initialization skipped by bootstrap options.");
+    } else {
+      logWarning("DSN not set, crash reporting cannot be used in this version of Intiface Central");
+    }
+
+    if (isDesktop() && options.initializeWindowing) {
+      // Must add this line before we work with the manager.
+      await windowManager.ensureInitialized();
+
+      String windowTitle = kDebugMode ? "Intiface® Central $packageVersion DEBUG" : "Intiface® Central $packageVersion";
+
+      WindowOptions windowOptions = const WindowOptions(
+        //center: true,
+        //title: windowTitle,
+        //backgroundColor: Colors.transparent,
+      );
+
+      windowManager.setTitle(windowTitle);
+
+      windowManager.addListener(this);
+      _configCubit = configCubit;
+
+      // #87: Fetch our displays and make sure what we're trying to show is in bounds. If it isn't, set to top left of
+      // main display.
+
+      var displays = await screenRetriever.getAllDisplays();
+      var windowPosition = guiSettingsCubit.getWindowPosition();
+      var windowInBounds = false;
+      for (var display in displays) {
+        logInfo(
+          "Testing window position $windowPosition against ${display.name} (${display.size} ${display.visiblePosition})",
+        );
+        if (display.visiblePosition!.dx < windowPosition.dx &&
+            (display.visiblePosition!.dx + display.size.width) > windowPosition.dx &&
+            display.visiblePosition!.dy < windowPosition.dy &&
+            (display.visiblePosition!.dy + display.size.height) > windowPosition.dy) {
+          windowInBounds = true;
+          logInfo("Window in bounds for ${display.name}");
+          break;
+        }
+      }
+      if (!windowInBounds) {
+        logInfo("Window position out of bounds, resetting position");
+        guiSettingsCubit.setWindowPosition(const Offset(0.0, 0.0));
+      } else if (configCubit.restoreWindowLocation) {
+        // Only restore the window location if the option to do so is on.
+        logInfo("Restoring window position to ${guiSettingsCubit.getWindowPosition()}");
+        await windowManager.setPosition(guiSettingsCubit.getWindowPosition());
+      } else {
+        logInfo("Window location not restored due to configuration settings");
+      }
+
+      windowDisplayModeResize(configCubit.useCompactDisplay, guiSettingsCubit);
+      await windowManager.waitUntilReadyToShow(windowOptions, () async {
+        await windowManager.show();
+        await windowManager.focus();
+      });
+
+      configCubit.stream.listen((event) {
+        if (event is! UseCompactDisplayState) {
+          return;
+        }
+        windowDisplayModeResize(event.value, guiSettingsCubit);
+      });
+
+      // Only add app update checks on desktop, mobile apps will use stores.
+      if (options.initializeUpdates) {
+        updateRepo.addProvider(IntifaceCentralDesktopUpdater());
+      }
+    } else if (!isDesktop() && options.requestPlatformPermissions) {
+      DeviceInfoPlugin deviceInfo = DeviceInfoPlugin();
+
+      // For older android builds, ask for location perms.
+      if (Platform.isAndroid) {
+        AndroidDeviceInfo androidInfo = await deviceInfo.androidInfo;
+
+        if (androidInfo.version.sdkInt <= 30) {
+          await [
+            Permission.bluetooth,
+            Permission.location,
+            Permission.locationWhenInUse,
+            Permission.locationAlways,
+          ].request();
+        }
+      }
+      if (Platform.isAndroid) {
+        await [Permission.bluetoothConnect, Permission.bluetoothScan, Permission.notification].request();
+      } else if (Platform.isIOS) {
+        await Permission.bluetooth.request();
+      }
+
+      if (configCubit.useForegroundProcess) {
+        FlutterForegroundTask.init(
+          androidNotificationOptions: AndroidNotificationOptions(
+            channelId: 'notification_channel_id',
+            channelName: 'Intiface Engine Notification',
+            channelDescription: 'This notification appears when the Intiface Engine foreground service is running.',
+            channelImportance: NotificationChannelImportance.DEFAULT,
+            priority: NotificationPriority.DEFAULT,
+          ),
+          iosNotificationOptions: const IOSNotificationOptions(),
+          foregroundTaskOptions: ForegroundTaskOptions(
+            eventAction: ForegroundTaskEventAction.nothing(),
+            allowWakeLock: false,
+            allowWifiLock: true,
+            allowAutoRestart: false,
+          ),
+        );
+        FlutterForegroundTask.initCommunicationPort();
+      }
+    }
+    var errorNotifierCubit = ErrorNotifierCubit();
+
+    errorNotifier.stream.listen((record) {
+      errorNotifierCubit.emitError(record);
+    });
+
+    if (kDebugMode) {
+      logWarning("Intiface currently running in DEBUG MODE.");
+    }
+
+    configCubit.currentAppVersion = packageVersion;
+
+    var deviceConfigVersion = await DeviceConfiguration.getBaseConfigFileVersion();
+    configCubit.currentDeviceConfigVersion = deviceConfigVersion;
+
+    var networkCubit = await NetworkInfoCubit.create();
+
+    EngineRepository engineRepo;
+    if (isDesktop()) {
+      engineRepo = EngineRepository(LibraryEngineProvider());
+    } else {
+      engineRepo = configCubit.useForegroundProcess
+          ? EngineRepository(ForegroundTaskLibraryEngineProvider())
+          : EngineRepository(LibraryEngineProvider());
+    }
+
+    var assetCubit = await AssetCubit.create();
+
+    var updateBloc = UpdateBloc(updateRepo);
+
+    updateBloc.stream.listen((state) async {
+      if (state is NewsUpdateRetrieved) {
+        configCubit.currentNewsEtag = state.version;
+        await assetCubit.update();
+      }
+      if (state is DeviceConfigUpdateRetrieved) {
+        configCubit.currentDeviceConfigEtag = state.version;
+        // Load the file and pull internal version while we're at it.
+        var deviceConfigVersion = await DeviceConfiguration.getBaseConfigFileVersion();
+        configCubit.currentDeviceConfigVersion = deviceConfigVersion;
+      }
+      if (isDesktop()) {
+        if (state is IntifaceCentralUpdateAvailable) {
+          configCubit.latestAppVersion = state.version;
+        }
+      }
+    });
+
+    if (options.initializeUpdates && configCubit.checkForUpdateOnStart) {
+      updateBloc.add(RunUpdate());
+    }
+
+    var engineControlBloc = EngineControlBloc(engineRepo);
+    _engineControlBloc = engineControlBloc;
+
+    // Set up system tray on supported platforms (Windows/macOS only, not Linux)
+    if (options.initializeTray && supportsTray()) {
+      await _setupTray(configCubit);
+
+      // Update tray menu when engine state changes
+      engineControlBloc.stream.listen((state) {
+        if (state is EngineStartedState || state is EngineStoppedState || state is EngineServerCreatedState) {
+          _updateTrayMenu();
+        }
+      });
+
+      // React to tray setting changes
+      configCubit.stream.listen((event) {
+        if (event is TrayIconModeState) {
+          _setupTray(configCubit);
+        }
+      });
+    }
+
+    var deviceControlBloc = DeviceManagerBloc(
+        engineControlBloc.stream, engineControlBloc.add, () => engineRepo.observationStream);
+
+    ///
+    /// ORDER MATTERS HERE
+    ///
+    /// We need to bind to our library and start making calls as late as possible, so we can collect as much information
+    /// about bootup as possible before we possibly crash on a native error.
+
+    // Bring up the FFI now that we have logging available and crash logging set up.
+    // initializeApi();
+    try {
+      await RustLib.init(externalLibrary: options.rustExternalLibrary);
+    } catch (e) {
+      final message = e.toString().toLowerCase();
+      if (message.contains('already') && message.contains('initializ')) {
+        logWarning("Rust API already initialized, continuing. Error: $e");
+      } else {
+        rethrow;
+      }
+    }
+
+    if (options.afterRustInit != null) {
+      await options.afterRustInit!();
+    }
+
+    // Setup logging before initializing the DCM
+    var apiLog = NativeApiLog();
+
+    var userConfigCubit = await UserDeviceConfigurationCubit.create();
+
+    if (options.afterUserDeviceConfigurationInit != null) {
+      await options.afterUserDeviceConfigurationInit!(userConfigCubit);
+    }
+
+    await _apiLogSubscription?.cancel();
+    _apiLogSubscription = apiLog.logMessageStream.listen((message) {
+      var level = message.level;
+      if (level == "DEBUG") {
+        logDebug(message.fields["message"]);
+      } else if (level == "INFO") {
+        logInfo(message.fields["message"]);
+      } else if (level == "ERROR") {
+        logError(message.fields["message"]);
+      } else if (level == "WARN") {
+        logWarning(message.fields["message"]);
+      } else if (level == "TRACE") {
+        // TODO Implement trace logging level for loggy
+        //log(message.engineLog!.message!.fields["message"]);
+      }
+    });
+
+    if (options.initializeSentry && const String.fromEnvironment('SENTRY_DSN').isNotEmpty) {
+      await crashReporting(sentryApiKey: const String.fromEnvironment('SENTRY_DSN'));
+    }
+
+    DiscordBloc discordBloc = DiscordBloc();
+    if (options.initializeDiscord && isDesktop() && configCubit.useDiscordRichPresence) {
+      logInfo("Discord Rich Presence on.");
+    } else {
+      logInfo("Discord Rich Presence off.");
+    }
+
+    engineControlBloc.stream.listen((state) async {
+      if (state is ProviderLogMessageState) {
+        // TODO Turn level into an enum
+        var message = state.message.message;
+        var level = state.message.level;
+        if (level == "DEBUG") {
+          logDebug(message);
+        } else if (level == "INFO") {
+          logInfo(message);
+        } else if (level == "ERROR") {
+          logError(message);
+        } else if (level == "WARN") {
+          logWarning(message);
+        } else if (level == "TRACE") {
+          // TODO Implement trace logging level for loggy
+          //log(message.engineLog!.message!.fields["message"]);
+        }
+      }
+      if (state is EngineServerCreatedState) {
+        deviceControlBloc.add(DeviceManagerEngineStartedEvent());
+        if (Platform.isIOS) {
+          final service = state.service;
+          if (service?.serviceType != null &&
+              service?.instanceName != null &&
+              service?.port != null) {
+            final started = await MdnsPlatformService.instance.startMdnsPublisher(
+              serviceType: service!.serviceType!,
+              instanceName: service.instanceName!,
+              port: service.port!,
+              txtRecords: service.txtRecords ?? const [],
+            );
+            if (started) {
+              logInfo("Started native iOS mDNS publisher");
+            } else {
+              logWarning("Native iOS mDNS publisher did not start");
+            }
+          }
+        }
+        if (options.initializeDiscord && isDesktop() && configCubit.useDiscordRichPresence) {
+          discordBloc.add(DiscordEngineStartedEvent());
+        }
+      }
+      if (state is EngineStoppedState) {
+        deviceControlBloc.add(DeviceManagerEngineStoppedEvent());
+        if (Platform.isIOS) {
+          await MdnsPlatformService.instance.stopMdnsPublisher();
+        }
+        if (options.initializeDiscord && isDesktop() && configCubit.useDiscordRichPresence) {
+          discordBloc.add(DiscordEngineStoppedEvent());
+        }
+      }
+      if (state is DeviceConnectedState) {
+        logInfo("Updating device ${state.name} index to ${state.index}");
+        await userConfigCubit.update();
+      }
+    });
+
+    if (options.initializeDiscord && isDesktop()) {
+      deviceControlBloc.stream.listen((state) async {
+        if (!configCubit.useDiscordRichPresence) return;
+
+        if (state is DeviceManagerDeviceOnlineState) {
+          discordBloc.add(DiscordDeviceAddedEvent((state).device));
+        }
+
+        if (state is DeviceManagerDeviceOfflineState) {
+          discordBloc.add(DiscordDeviceRemovedEvent((state).device));
+        }
+      });
+    }
+
+    if (kDebugMode) {
+      // Make sure the engine is stopped, just in case we've reloaded.
+      engineControlBloc.add(EngineControlEventStop());
+    }
+
+    if (configCubit.startServerOnStartup) {
+      var btProblem = await checkBluetoothReady();
+      if (btProblem != null) {
+        logWarning('Skipping autostart: $btProblem');
+      } else {
+        engineControlBloc.add(EngineControlEventStart(options: await configCubit.getEngineOptions()));
+      }
+    }
+
+    // Make sure we only send crash reports if crash reporting is on or if the user is doing a manual log submission.
+    IntifaceCentralApp.eventProcessors.add((event, {hint}) {
+      logInfo(event.eventId);
+      if (!configCubit.crashReporting) {
+        if (event.tags?.containsKey("ManualLogSubmit") != true) {
+          logWarning("Crash/error received but CrashReporting is off, not sending to devs.");
+          return false;
+        }
+        logWarning("Manual log submission, crashReporting is off, overriding and sending to devs.");
+      } else {
+        logWarning("Submitting crash report/logs to developers.");
+      }
+      return true;
+    });
+
+    return MultiBlocProvider(
+      providers: [
+        BlocProvider(create: (context) => engineControlBloc),
+        BlocProvider(create: (context) => deviceControlBloc),
+        BlocProvider(create: (context) => NavigationCubit()),
+        BlocProvider(create: (context) => updateBloc),
+        BlocProvider(create: (context) => assetCubit),
+        BlocProvider(create: (context) => configCubit),
+        BlocProvider(create: (context) => networkCubit),
+        BlocProvider(create: (context) => errorNotifierCubit),
+        BlocProvider(create: (context) => userConfigCubit),
+        BlocProvider(create: (context) => guiSettingsCubit),
+        // Discord RPC won't work on mobile
+        if (options.initializeDiscord && isDesktop()) BlocProvider(create: (context) => discordBloc),
+      ],
+      child: const IntifaceCentralView(),
+    );
+  }
+
+  // This widget is the root of your application.
+  @override
+  Widget build(BuildContext context) {
+    return BlocProvider(
+      create: (context) => AppResetCubit(),
+      child: BlocBuilder<AppResetCubit, AppResetState>(
+        builder: (context, state) {
+          // Clear cached future on app reset to force re-initialization
+          if (state is AppResetTriggerState) {
+            _buildAppFuture = null;
+          }
+          // Cache the future to prevent multiple concurrent buildApp() calls
+          // which can cause FFI conflicts and race conditions
+          _buildAppFuture ??= buildApp();
+          return FutureBuilder(
+            future: _buildAppFuture,
+            builder: (BuildContext context, AsyncSnapshot<Widget> snapshot) {
+              if (snapshot.hasData) {
+                return snapshot.data!;
+              }
+              return const MaterialApp(
+                title: 'Intiface Central',
+                debugShowCheckedModeBanner: false,
+                home: Scaffold(
+                  body: Center(child: Image(image: AssetImage('assets/icons/intiface_central_icon.png'))),
+                ),
+              );
+            },
+          );
+        },
+      ),
+    );
+  }
+}
+
+class IntifaceCentralView extends StatelessWidget {
+  const IntifaceCentralView({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    final configCubit = BlocProvider.of<IntifaceConfigurationCubit>(context);
+    logInfo("Using theme mode: ${configCubit.themeModeSetting}");
+    return BlocBuilder<IntifaceConfigurationCubit, IntifaceConfigurationState>(
+      buildWhen: (previous, current) => current is ThemeModeSettingState || current is ConfigurationResetState,
+      builder: (context, state) {
+        final themeMode = switch (configCubit.themeModeSetting) {
+          "light" => ThemeMode.light,
+          "dark" => ThemeMode.dark,
+          _ => ThemeMode.system,
+        };
+        return MaterialApp(
+          title: 'Intiface Central',
+          debugShowCheckedModeBanner: false,
+          theme: ThemeData(brightness: Brightness.light, primarySwatch: Colors.blue, useMaterial3: true),
+          darkTheme: ThemeData(brightness: Brightness.dark, primarySwatch: Colors.blue, useMaterial3: true),
+          themeMode: themeMode,
+          home: const IntifaceCentralPage(),
+        );
+      },
+    );
+  }
+}
+
+class IntifaceCentralPage extends StatelessWidget {
+  const IntifaceCentralPage({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: BlocBuilder<IntifaceConfigurationCubit, IntifaceConfigurationState>(
+        buildWhen: (previous, current) => current is UseCompactDisplayState || current is ConfigurationResetState,
+        builder: (context, state) {
+          var useCompactDisplay = BlocProvider.of<IntifaceConfigurationCubit>(context).useCompactDisplay;
+          List<Widget> widgets = [const ControlWidget()];
+          if (!isDesktop() || !useCompactDisplay) {
+            widgets.addAll(const [Divider(height: 2), Expanded(child: BodyWidget())]);
+          }
+          var userCubit = BlocProvider.of<UserDeviceConfigurationCubit>(context);
+          var configCubit = BlocProvider.of<IntifaceConfigurationCubit>(context);
+          final showDongleDeprecation =
+              (configCubit.useLovenseHIDDongle || configCubit.useLovenseSerialDongle) &&
+              !configCubit.hasAcknowledgedLovenseDongleDeprecation;
+          if (showDongleDeprecation) {
+            configCubit.hasAcknowledgedLovenseDongleDeprecation = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              showDialog<void>(
+                context: context,
+                builder: (context) => AlertDialog(
+                  title: const Text("Lovense USB Dongle Deprecated"),
+                  content: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text("The Lovense USB Dongle device managers are deprecated and will be removed in the next version of Intiface Central."),
+                      const SizedBox(height: 12),
+                      InkWell(
+                        onTap: () => launchUrlString("https://intiface.com/docs/intiface-central/brands/lovense/"),
+                        child: const Text("Learn more", style: TextStyle(color: Colors.blue, decoration: TextDecoration.underline)),
+                      ),
+                    ],
+                  ),
+                  actions: [TextButton(onPressed: () => Navigator.of(context).pop(), child: const Text('OK'))],
+                ),
+              );
+            });
+          }
+          if (userCubit.createError != null) {
+            WidgetsBinding.instance.addPostFrameCallback(
+              (_) => showDialog<void>(
+                context: context,
+                barrierDismissible: false, // user must tap button!
+                builder: (BuildContext context) {
+                  return AlertDialog(
+                    title: const Text('Error Loading Configs'),
+                    content: const SingleChildScrollView(
+                      child: ListBody(
+                        children: <Widget>[
+                          Text(
+                            "Intiface Central configuration files were not able to load. They have been deleted and defaults will be restored. Any user specified configurations will need to be reset. We also recommend closing and reopening Intiface Central.",
+                          ),
+                        ],
+                      ),
+                    ),
+                    actions: <Widget>[
+                      TextButton(
+                        child: const Text('Ok'),
+                        onPressed: () {
+                          Navigator.of(context).pop();
+                        },
+                      ),
+                    ],
+                  );
+                },
+              ),
+            );
+          }
+          return Scaffold(body: Column(children: widgets));
+        },
+      ),
+    );
+  }
+}

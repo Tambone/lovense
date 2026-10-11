@@ -1,0 +1,171 @@
+import 'dart:async';
+import 'dart:collection';
+import 'dart:convert';
+import 'dart:io';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_loggy/flutter_loggy.dart';
+import 'package:loggy/loggy.dart';
+import 'package:intiface_central/util/intiface_util.dart';
+import 'package:rxdart/rxdart.dart';
+
+class RecordMetadata {
+  //final Map<String, String> _tags = {};
+  final double _elapsed;
+
+  RecordMetadata(this._elapsed);
+
+  double get elapsed => _elapsed;
+}
+
+/// Stream printer will take another [LoggyPrinter] as it's [childPrinter] all logs will
+/// pass through [childPrinter] as well.
+///
+/// This allows [LoggyStreamWidget] to display logs as well.
+class IntifaceStreamPrinter extends LoggyPrinter {
+  static const int maxRetainedRecords = 1000;
+
+  static final DateTime _appStartTime = DateTime.now();
+
+  IntifaceStreamPrinter(this.childPrinter) : super();
+
+  final LoggyPrinter childPrinter;
+  final ListQueue<LogRecord> _records = ListQueue<LogRecord>(
+    maxRetainedRecords,
+  );
+  final BehaviorSubject<List<LogRecord>> logRecord =
+      BehaviorSubject<List<LogRecord>>.seeded(<LogRecord>[]);
+
+  @override
+  void onLog(LogRecord record) {
+    LogRecord newRecord = LogRecord(
+      record.level,
+      record.message,
+      record.loggerName,
+      record.error,
+      record.stackTrace,
+      record.zone,
+      RecordMetadata(
+        DateTime.now().difference(_appStartTime).inMilliseconds / 1000.0,
+      ),
+      record.callerFrame,
+    );
+
+    childPrinter.onLog(newRecord);
+
+    _records.addFirst(newRecord);
+    while (_records.length > maxRetainedRecords) {
+      _records.removeLast();
+    }
+    logRecord.add(List<LogRecord>.unmodifiable(_records));
+  }
+
+  void dispose() {
+    logRecord.close();
+  }
+}
+
+// From https://github.com/infinum/floggy/issues/50
+class FileOutput extends LoggyPrinter {
+  static const int maxFileSizeBytes = 10 * 1024 * 1024;
+
+  static final DateTime _appStartTime = DateTime.now();
+
+  FileOutput() : super() {
+    _sink = _openSink();
+  }
+
+  IOSink? _sink;
+  int _bytesWritten = 0;
+  bool _truncating = false;
+
+  static IOSink _openSink() =>
+      IntifacePaths.logFile.openWrite(mode: FileMode.writeOnly, encoding: utf8);
+
+  @override
+  void onLog(LogRecord record) {
+    var logString =
+        "${DateTime.now().difference(_appStartTime).inMilliseconds / 1000.0} : [${record.level.toString().substring(0, 1)}] : ${record.message}";
+    var lineBytes = utf8.encode(logString).length + 1;
+
+    if (!_truncating && _bytesWritten + lineBytes > maxFileSizeBytes) {
+      _truncate();
+    }
+
+    _sink?.writeln(logString);
+    _bytesWritten += lineBytes;
+  }
+
+  // The old sink has to finish closing before the replacement opens, otherwise
+  // its buffered tail flushes at the pre-truncation offset and reinflates the
+  // file. Records logged during that window are dropped rather than queued.
+  Future<void> _truncate() async {
+    _truncating = true;
+    var oldSink = _sink;
+    _sink = null;
+    await oldSink?.close();
+    _sink = _openSink();
+    _bytesWritten = 0;
+    _truncating = false;
+  }
+}
+
+class ErrorNotifier extends LoggyPrinter {
+  ErrorNotifier() : super();
+
+  final StreamController<LogRecord> _errorStream = StreamController();
+
+  Stream<LogRecord> get stream => _errorStream.stream;
+
+  @override
+  void onLog(LogRecord record) async {
+    if (record.level == LogLevel.error) {
+      if (_errorStream.hasListener) {
+        _errorStream.add(record);
+      }
+    }
+  }
+}
+
+class LogcatPrinter extends LoggyPrinter {
+  LogcatPrinter() : super();
+
+  @override
+  void onLog(LogRecord record) {
+    // ignore: avoid_print
+    print(
+      "[${record.level.toString().substring(0, 1)}] ${record.loggerName}: ${record.message}",
+    );
+  }
+}
+
+class MultiPrinter extends LoggyPrinter {
+  MultiPrinter(ErrorNotifier errorNotifier) {
+    _printers.add(errorNotifier);
+    if (!kReleaseMode) {
+      _printers.add(const PrettyPrinter());
+    }
+    if (Platform.isAndroid) {
+      _printers.add(LogcatPrinter());
+    }
+  }
+
+  final List<LoggyPrinter> _printers = [];
+
+  void addFilePrinter() {
+    _printers.add(FileOutput());
+  }
+
+  @override
+  void onLog(LogRecord record) {
+    for (var printer in _printers) {
+      printer.onLog(record);
+    }
+  }
+}
+
+void initLogging(MultiPrinter multiPrinter) {
+  Loggy.initLoggy(
+    logPrinter: IntifaceStreamPrinter(multiPrinter),
+    logOptions: const LogOptions(LogLevel.all, stackTraceLevel: LogLevel.error),
+  );
+}
