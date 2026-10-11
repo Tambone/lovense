@@ -1,0 +1,28 @@
+name: Verify packaged Windows application
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful Windows build run containing the app artifact
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: read
+jobs:
+  package:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download the completed app artifact
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+        run: |
+          if ($env:BUILD_RUN_ID -notmatch '^[0-9]+$') { throw 'Expected a numeric build run ID.' }
+          gh run download $env:BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY --name Intiface-Central-Lovense-Windows-x64 --dir package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify runtime files and launch the packaged app
+        run: python scripts/ci-command.py pwsh -NoProfile -File scripts/verify-windows-bundle.ps1 -Archive package/Intiface-Central-Lovense-Windows-x64.zip
