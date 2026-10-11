@@ -22,6 +22,8 @@ jobs:
           BUILD_RUN_ID: ${{ inputs.build_run_id }}
         run: |
           if ($env:BUILD_RUN_ID -notmatch '^[0-9]+$') { throw 'Expected a numeric build run ID.' }
+          gh run watch $env:BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY --interval 20 --exit-status
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           gh run download $env:BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY --name Intiface-Central-Lovense-Windows-x64 --dir package
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $log = & gh run view $env:BUILD_RUN_ID --repo $env:GITHUB_REPOSITORY --log
